@@ -113,17 +113,29 @@ The CSV file contains the following columns:
 | Column | Description |
 |--------|-------------|
 | observation_id | Unique iNaturalist observation ID |
-| observed_on | Date the observation was made |
+| observed_on | Date the observation was made (YYYY-MM-DD) |
+| Encounter.year | Year of observation (parsed from observed_on) |
+| Encounter.month | Month of observation (parsed from observed_on) |
+| Encounter.day | Day of observation (parsed from observed_on) |
 | scientific_name | Scientific name of the species |
+| Encounter.genus | Genus name (first word of scientific name) |
+| Encounter.specificEpithet | Specific epithet (second word of scientific name) |
 | common_name | Common name of the species |
-| latitude | Latitude coordinate |
-| longitude | Longitude coordinate |
-| place_name | Location description |
+| Encounter.decimalLatitude | Latitude coordinate in decimal degrees |
+| Encounter.decimalLongitude | Longitude coordinate in decimal degrees |
+| Encounter.verbatimLocality | Location description as entered by observer |
+| Encounter.livingStatus | Living status of organism ("alive", "dead", or empty) |
 | observer | iNaturalist username of observer |
 | quality_grade | Quality grade (research, needs_id, casual) |
 | url | Link to observation on iNaturalist |
+| Encounter.researcherComments | Download metadata including date and source URL |
 | photo_count | Number of photos for this observation |
 | photo_filenames | Semicolon-separated list of photo filenames |
+| Encounter.mediaAsset0 | Filename of first photo (if present) |
+| Encounter.mediaAsset1 | Filename of second photo (if present) |
+| Encounter.mediaAsset2... | Additional photo columns (dynamically created) |
+
+**Note:** The number of `Encounter.mediaAsset` columns is determined by the maximum number of photos across all observations in the dataset. Observations with fewer photos will have empty cells in the extra columns.
 
 ### Photo Files
 

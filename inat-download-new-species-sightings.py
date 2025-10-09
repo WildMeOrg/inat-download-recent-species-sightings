@@ -234,6 +234,48 @@ class iNaturalistDownloader:
                 scientific_name = species_name
                 common_name = ''
 
+            # Parse date components from observed_on (format: YYYY-MM-DD)
+            encounter_year = None
+            encounter_month = None
+            encounter_day = None
+            if observed_on and observed_on != 'Unknown':
+                try:
+                    date_parts = observed_on.split('-')
+                    if len(date_parts) >= 3:
+                        encounter_year = date_parts[0]
+                        encounter_month = date_parts[1]
+                        encounter_day = date_parts[2]
+                except Exception:
+                    pass  # Keep as None if parsing fails
+
+            # Parse scientific name into genus and specific epithet
+            encounter_genus = None
+            encounter_specific_epithet = None
+            if scientific_name:
+                name_parts = scientific_name.split()
+                if len(name_parts) >= 1:
+                    encounter_genus = name_parts[0]
+                if len(name_parts) >= 2:
+                    encounter_specific_epithet = name_parts[1]
+
+            # Create researcher comments with download date and source URL
+            today_date = datetime.now().strftime("%Y-%m-%d")
+            researcher_comments = f"Observation downloaded from iNaturalist on {today_date}. Source: {obs_url}"
+
+            # Parse annotations for living status
+            living_status = ''
+            annotations = obs.get('annotations')
+            if annotations and isinstance(annotations, list):
+                for annotation in annotations:
+                    if isinstance(annotation, dict):
+                        controlled_value_id = annotation.get('controlled_value_id')
+                        if controlled_value_id == 19:
+                            living_status = 'dead'
+                            break
+                        elif controlled_value_id == 14:
+                            living_status = 'alive'
+                            break
+
             # Download photos
             photos = obs.get('photos', [])
             photo_filenames = []
@@ -259,16 +301,24 @@ class iNaturalistDownloader:
             row = {
                 'observation_id': obs_id,
                 'observed_on': observed_on,
+                'Encounter.year': encounter_year,
+                'Encounter.month': encounter_month,
+                'Encounter.day': encounter_day,
                 'scientific_name': scientific_name,
+                'Encounter.genus': encounter_genus,
+                'Encounter.specificEpithet': encounter_specific_epithet,
                 'common_name': common_name,
-                'latitude': latitude,
-                'longitude': longitude,
-                'place_name': place_guess,
+                'Encounter.decimalLatitude': latitude,
+                'Encounter.decimalLongitude': longitude,
+                'Encounter.verbatimLocality': place_guess,
+                'Encounter.livingStatus': living_status,
                 'observer': observer,
                 'quality_grade': quality_grade,
                 'url': obs_url,
+                'Encounter.researcherComments': researcher_comments,
                 'photo_count': len(photo_filenames),
-                'photo_filenames': '; '.join(photo_filenames)
+                'photo_filenames': '; '.join(photo_filenames),
+                '_photo_list': photo_filenames  # Temporary field for photo processing
             }
 
             processed_data.append(row)
@@ -289,20 +339,48 @@ class iNaturalistDownloader:
 
         csv_path = self.output_dir / filename
 
+        # Determine maximum number of photos across all observations
+        max_photos = 0
+        for row in data:
+            photo_list = row.get('_photo_list', [])
+            if len(photo_list) > max_photos:
+                max_photos = len(photo_list)
+
+        # Add individual photo columns to each row
+        for row in data:
+            photo_list = row.get('_photo_list', [])
+            for i in range(max_photos):
+                column_name = f'Encounter.mediaAsset{i}'
+                row[column_name] = photo_list[i] if i < len(photo_list) else None
+            # Remove temporary field
+            del row['_photo_list']
+
+        # Build fieldnames with dynamic photo columns
         fieldnames = [
             'observation_id',
             'observed_on',
+            'Encounter.year',
+            'Encounter.month',
+            'Encounter.day',
             'scientific_name',
+            'Encounter.genus',
+            'Encounter.specificEpithet',
             'common_name',
-            'latitude',
-            'longitude',
-            'place_name',
+            'Encounter.decimalLatitude',
+            'Encounter.decimalLongitude',
+            'Encounter.verbatimLocality',
+            'Encounter.livingStatus',
             'observer',
             'quality_grade',
             'url',
+            'Encounter.researcherComments',
             'photo_count',
             'photo_filenames'
         ]
+
+        # Add photo asset columns
+        for i in range(max_photos):
+            fieldnames.append(f'Encounter.mediaAsset{i}')
 
         with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -311,6 +389,8 @@ class iNaturalistDownloader:
 
         print(f"\nCSV file written: {csv_path}")
         print(f"Total observations: {len(data)}")
+        if max_photos > 0:
+            print(f"Maximum photos per observation: {max_photos}")
 
     def run(self):
         """Main execution method."""
