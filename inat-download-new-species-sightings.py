@@ -263,7 +263,7 @@ class iNaturalistDownloader:
             researcher_comments = f"Observation downloaded from iNaturalist on {today_date}. Source: {obs_url}"
 
             # Parse annotations for living status
-            living_status = ''
+            living_status = 'alive'  # Default to 'alive'
             annotations = obs.get('annotations')
             if annotations and isinstance(annotations, list):
                 for annotation in annotations:
@@ -279,6 +279,7 @@ class iNaturalistDownloader:
             # Download photos
             photos = obs.get('photos', [])
             photo_filenames = []
+            photo_licenses = []
 
             if photos:
                 print(f"  Processing observation {idx}/{len(observations)} (ID: {obs_id}, {len(photos)} photos)...")
@@ -286,6 +287,9 @@ class iNaturalistDownloader:
                 for photo_idx, photo in enumerate(photos, 1):
                     # Use original or large size
                     photo_url = photo.get('url', '').replace('square', 'original')
+
+                    # Get license code
+                    license_code = photo.get('license_code', '')
 
                     # Create unique filename
                     photo_ext = photo_url.split('.')[-1].split('?')[0]
@@ -296,6 +300,7 @@ class iNaturalistDownloader:
 
                     if self.download_photo(photo_url, photo_filename):
                         photo_filenames.append(photo_filename)
+                        photo_licenses.append(license_code)
 
             # Create row for CSV
             row = {
@@ -318,7 +323,8 @@ class iNaturalistDownloader:
                 'Encounter.researcherComments': researcher_comments,
                 'photo_count': len(photo_filenames),
                 'photo_filenames': '; '.join(photo_filenames),
-                '_photo_list': photo_filenames  # Temporary field for photo processing
+                '_photo_list': photo_filenames,  # Temporary field for photo processing
+                '_license_list': photo_licenses  # Temporary field for license processing
             }
 
             processed_data.append(row)
@@ -346,14 +352,20 @@ class iNaturalistDownloader:
             if len(photo_list) > max_photos:
                 max_photos = len(photo_list)
 
-        # Add individual photo columns to each row
+        # Add individual photo columns and license columns to each row
         for row in data:
             photo_list = row.get('_photo_list', [])
+            license_list = row.get('_license_list', [])
             for i in range(max_photos):
-                column_name = f'Encounter.mediaAsset{i}'
-                row[column_name] = photo_list[i] if i < len(photo_list) else None
-            # Remove temporary field
+                # Add photo filename column
+                photo_column_name = f'Encounter.mediaAsset{i}'
+                row[photo_column_name] = photo_list[i] if i < len(photo_list) else None
+                # Add license column
+                license_column_name = f'Encounter.mediaAsset{i}.license'
+                row[license_column_name] = license_list[i] if i < len(license_list) else None
+            # Remove temporary fields
             del row['_photo_list']
+            del row['_license_list']
 
         # Build fieldnames with dynamic photo columns
         fieldnames = [
@@ -378,9 +390,10 @@ class iNaturalistDownloader:
             'photo_filenames'
         ]
 
-        # Add photo asset columns
+        # Add photo asset columns and license columns
         for i in range(max_photos):
             fieldnames.append(f'Encounter.mediaAsset{i}')
+            fieldnames.append(f'Encounter.mediaAsset{i}.license')
 
         with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
