@@ -1,6 +1,6 @@
-# iNaturalist Species Observations Downloader
+# iNaturalist Species Observations Downloader for Wildbook Bulk Import
 
-A Python utility for downloading recent observations of specific species from iNaturalist, including observation data (CSV) and photos. Created for the SeadragonSearch.org program to help track leafy and weedy seadragon sightings.
+A Python utility for downloading recent observations of specific species from iNaturalist, including observation data (CSV) and photos. Created for the Wildbook program to help incorporate iNaturalist sightings into Wildbook via bulk import.
 
 ## Features
 
