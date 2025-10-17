@@ -7,7 +7,9 @@ A Python utility for downloading recent observations of specific species from iN
 - Downloads observations from iNaturalist for specified species
 - Configurable time range (number of days back)
 - Downloads all photos associated with each observation
-- Exports data to CSV format with one row per observation
+- **Two output modes:**
+  - **CSV mode**: Direct export to CSV for immediate bulk import
+  - **Interactive HTML review**: Visual review interface to select high-quality observations before export
 - Includes observation metadata: date, location, observer, quality grade, etc.
 - Handles pagination automatically for large result sets
 - Uses only Python standard library (no external dependencies)
@@ -44,10 +46,11 @@ python3 inat-download-new-species-sightings.py --species SPECIES_NAME [OPTIONS]
 - `--days`: Number of days back to search (default: 30)
 - `--output`: Output directory for CSV and photos (default: ./inat_data)
 - `--rate-limit`: Seconds to wait between iNaturalist API calls (default: 1.0)
+- `--html-review`: Generate interactive HTML review page instead of direct CSV export
 
 ### Examples
 
-#### Download seadragon observations from the last 30 days
+#### Download seadragon observations from the last 30 days (direct CSV)
 
 ```bash
 python3 inat-download-new-species-sightings.py \
@@ -55,6 +58,23 @@ python3 inat-download-new-species-sightings.py \
   --days 30 \
   --output ./seadragon_data
 ```
+
+#### Generate HTML review page for manual quality control
+
+```bash
+python3 inat-download-new-species-sightings.py \
+  --species "leafy seadragon" \
+  --days 60 \
+  --html-review \
+  --output ./data
+```
+
+This creates an interactive HTML page where you can:
+- View photo thumbnails for each observation
+- Review observation metadata (date, location, quality grade, etc.)
+- Select/deselect observations using checkboxes
+- See the resulting CSV content update dynamically
+- Copy the CSV to clipboard or download it directly
 
 #### Download leafy seadragon observations from the last 7 days
 
@@ -94,6 +114,8 @@ python3 inat-download-new-species-sightings.py \
 
 ## Output Structure
 
+### CSV Mode (default)
+
 The utility creates the following structure:
 
 ```
@@ -105,6 +127,26 @@ output_directory/
     ├── 67890_1.jpg
     └── ...
 ```
+
+### HTML Review Mode (--html-review)
+
+The utility creates the following structure:
+
+```
+output_directory/
+├── inat_observations_review_YYYYMMDD_HHMMSS.html
+└── photos/
+    ├── 12345_1.jpg
+    ├── 12345_2.jpg
+    ├── 67890_1.jpg
+    └── ...
+```
+
+The HTML file can be opened in any web browser. It contains:
+- **Tab 1 - Review Observations**: Interactive table with photo thumbnails, checkboxes for selection, and observation details
+- **Tab 2 - CSV Export**: Dynamically generated CSV content based on your selections, with copy/download buttons
+
+**Note:** Keep the HTML file and `photos/` folder in the same directory for images to display correctly.
 
 ### CSV Format
 
