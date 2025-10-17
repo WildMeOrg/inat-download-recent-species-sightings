@@ -25,7 +25,7 @@ class iNaturalistDownloader:
 
     BASE_URL = "https://api.inaturalist.org/v1"
 
-    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0):
+    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False):
         """
         Initialize the downloader.
 
@@ -34,11 +34,13 @@ class iNaturalistDownloader:
             days_back: Number of days back to search for observations
             species_list: List of species names to search for
             rate_limit: Seconds to wait between API calls (default: 1.0)
+            html_review: Generate interactive HTML review instead of CSV (default: False)
         """
         self.output_dir = Path(output_dir)
         self.days_back = days_back
         self.species_list = species_list
         self.rate_limit = rate_limit
+        self.html_review = html_review
         self.photos_dir = self.output_dir / "photos"
 
         # Create directories if they don't exist
@@ -405,6 +407,744 @@ class iNaturalistDownloader:
         if max_photos > 0:
             print(f"Maximum photos per observation: {max_photos}")
 
+    def write_html(self, data: List[Dict[str, Any]], filename: str):
+        """
+        Write observation data to an interactive HTML review page.
+
+        Args:
+            data: List of observation dictionaries
+            filename: HTML filename
+        """
+        if not data:
+            print("No data to write to HTML")
+            return
+
+        html_path = self.output_dir / filename
+
+        # Determine maximum number of photos across all observations
+        max_photos = 0
+        for row in data:
+            photo_list = row.get('_photo_list', [])
+            if len(photo_list) > max_photos:
+                max_photos = len(photo_list)
+
+        # Build observation data with image file paths
+        observations_json = []
+        for row in data:
+            photo_list = row.get('_photo_list', [])
+            license_list = row.get('_license_list', [])
+
+            # Use file path for first photo preview
+            photo_path = None
+            if photo_list:
+                first_photo_path = self.photos_dir / photo_list[0]
+                if first_photo_path.exists():
+                    # Create relative path from HTML file to photo
+                    photo_path = f"photos/{photo_list[0]}"
+
+            # Build observation object
+            obs_data = {
+                'observation_id': row.get('observation_id'),
+                'observed_on': row.get('observed_on'),
+                'year': row.get('Encounter.year'),
+                'month': row.get('Encounter.month'),
+                'day': row.get('Encounter.day'),
+                'scientific_name': row.get('scientific_name'),
+                'genus': row.get('Encounter.genus'),
+                'specific_epithet': row.get('Encounter.specificEpithet'),
+                'common_name': row.get('common_name'),
+                'latitude': row.get('Encounter.decimalLatitude'),
+                'longitude': row.get('Encounter.decimalLongitude'),
+                'location': row.get('Encounter.verbatimLocality'),
+                'living_status': row.get('Encounter.livingStatus'),
+                'observer': row.get('observer'),
+                'quality_grade': row.get('quality_grade'),
+                'url': row.get('url'),
+                'researcher_comments': row.get('Encounter.researcherComments'),
+                'photo_count': len(photo_list),
+                'photo_filenames': '; '.join(photo_list),
+                'photo_path': photo_path,
+                'photos': [],
+                'licenses': []
+            }
+
+            # Add individual photo filenames and licenses
+            for i in range(max_photos):
+                obs_data['photos'].append(photo_list[i] if i < len(photo_list) else None)
+                obs_data['licenses'].append(license_list[i] if i < len(license_list) else None)
+
+            observations_json.append(obs_data)
+
+        # Generate HTML content
+        html_content = self._generate_html_template(observations_json, max_photos)
+
+        # Write HTML file
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+
+        print(f"\nHTML review page written: {html_path}")
+        print(f"Total observations: {len(data)}")
+        print(f"Open this file in your web browser to review and select observations.")
+        print(f"Maximum photos per observation: {max_photos}")
+
+    def _generate_html_template(self, observations: List[Dict], max_photos: int) -> str:
+        """Generate the HTML template with embedded JavaScript."""
+        observations_json_str = json.dumps(observations, indent=2)
+
+        return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>iNaturalist Observations Review</title>
+    <style>
+        * {{
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }}
+
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+        }}
+
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }}
+
+        .header {{
+            background: #2c7a3f;
+            color: white;
+            padding: 20px 30px;
+            border-radius: 8px 8px 0 0;
+        }}
+
+        .header h1 {{
+            font-size: 24px;
+            margin-bottom: 5px;
+        }}
+
+        .header p {{
+            opacity: 0.9;
+            font-size: 14px;
+        }}
+
+        .tabs {{
+            display: flex;
+            background: #e8e8e8;
+            border-bottom: 2px solid #ddd;
+        }}
+
+        .tab {{
+            padding: 15px 30px;
+            cursor: pointer;
+            font-weight: 500;
+            border: none;
+            background: transparent;
+            transition: all 0.2s;
+        }}
+
+        .tab:hover {{
+            background: #d8d8d8;
+        }}
+
+        .tab.active {{
+            background: white;
+            border-bottom: 3px solid #2c7a3f;
+        }}
+
+        .tab-content {{
+            display: none;
+            padding: 30px;
+        }}
+
+        .tab-content.active {{
+            display: block;
+        }}
+
+        .stats {{
+            background: #f9f9f9;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 30px;
+            align-items: center;
+        }}
+
+        .stat {{
+            display: flex;
+            flex-direction: column;
+        }}
+
+        .stat-label {{
+            font-size: 12px;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+
+        .stat-value {{
+            font-size: 24px;
+            font-weight: bold;
+            color: #2c7a3f;
+        }}
+
+        .controls {{
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+        }}
+
+        .btn {{
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }}
+
+        .btn-primary {{
+            background: #2c7a3f;
+            color: white;
+        }}
+
+        .btn-primary:hover {{
+            background: #235c31;
+        }}
+
+        .btn-secondary {{
+            background: #e0e0e0;
+            color: #333;
+        }}
+
+        .btn-secondary:hover {{
+            background: #d0d0d0;
+        }}
+
+        .table-wrapper {{
+            width: 100%;
+            overflow-x: auto;
+        }}
+
+        .observations-table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+
+        .observations-table thead {{
+            background: #f5f5f5;
+            position: sticky;
+            top: 0;
+        }}
+
+        .observations-table th {{
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            border-bottom: 2px solid #ddd;
+            white-space: nowrap;
+        }}
+
+        .observations-table td {{
+            padding: 12px;
+            border-bottom: 1px solid #eee;
+            vertical-align: top;
+        }}
+
+        .observations-table tbody tr:hover {{
+            background: #f9f9f9;
+        }}
+
+        .obs-checkbox {{
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }}
+
+        .photo-preview {{
+            width: 80px;
+            height: 80px;
+            object-fit: cover;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }}
+
+        .photo-preview:hover {{
+            transform: scale(1.1);
+        }}
+
+        .no-photo {{
+            width: 80px;
+            height: 80px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #999;
+            font-size: 12px;
+        }}
+
+        .quality-badge {{
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }}
+
+        .quality-research {{
+            background: #d4edda;
+            color: #155724;
+        }}
+
+        .quality-needs_id {{
+            background: #fff3cd;
+            color: #856404;
+        }}
+
+        .quality-casual {{
+            background: #f8d7da;
+            color: #721c24;
+        }}
+
+        .csv-output {{
+            background: #f5f5f5;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 20px;
+            font-family: "Courier New", monospace;
+            font-size: 12px;
+            white-space: pre;
+            overflow-x: auto;
+            max-height: 600px;
+            overflow-y: auto;
+        }}
+
+        .copy-success {{
+            display: none;
+            background: #d4edda;
+            color: #155724;
+            padding: 10px 15px;
+            border-radius: 5px;
+            margin-bottom: 10px;
+        }}
+
+        .copy-success.show {{
+            display: block;
+        }}
+
+        .modal {{
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            align-items: center;
+            justify-content: center;
+        }}
+
+        .modal.show {{
+            display: flex;
+        }}
+
+        .modal-content {{
+            max-width: 90%;
+            max-height: 90%;
+        }}
+
+        .modal-close {{
+            position: absolute;
+            top: 20px;
+            right: 30px;
+            color: white;
+            font-size: 40px;
+            font-weight: bold;
+            cursor: pointer;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>iNaturalist Observations Review</h1>
+            <p>Review observations and select which ones to include in your export</p>
+        </div>
+
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('review')">Review Observations</button>
+            <button class="tab" onclick="switchTab('csv')">CSV Export</button>
+        </div>
+
+        <div id="review-tab" class="tab-content active">
+            <div class="stats">
+                <div class="stat">
+                    <span class="stat-label">Total Observations</span>
+                    <span class="stat-value" id="total-count">0</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Selected</span>
+                    <span class="stat-value" id="selected-count">0</span>
+                </div>
+            </div>
+
+            <div class="controls">
+                <button class="btn btn-primary" onclick="selectAll()">Select All</button>
+                <button class="btn btn-secondary" onclick="deselectAll()">Deselect All</button>
+            </div>
+
+            <div class="table-wrapper">
+                <table class="observations-table">
+                    <thead>
+                        <tr>
+                            <th>Include</th>
+                            <th>Photo</th>
+                            <th>ID</th>
+                            <th>Date</th>
+                            <th>Species</th>
+                            <th>Location</th>
+                            <th>Observer</th>
+                            <th>Quality</th>
+                            <th>Photos</th>
+                        </tr>
+                    </thead>
+                    <tbody id="observations-body">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div id="csv-tab" class="tab-content">
+            <div class="copy-success" id="copy-success">
+                CSV content copied to clipboard!
+            </div>
+
+            <div class="controls">
+                <button class="btn btn-primary" onclick="copyCSV()">Copy CSV to Clipboard</button>
+                <button class="btn btn-secondary" onclick="downloadCSV()">Download CSV File</button>
+            </div>
+
+            <div class="csv-output" id="csv-output"></div>
+        </div>
+    </div>
+
+    <div id="photo-modal" class="modal" onclick="closeModal()">
+        <span class="modal-close">&times;</span>
+        <img class="modal-content" id="modal-image">
+    </div>
+
+    <script>
+        // Observation data
+        const observations = {observations_json_str};
+        const maxPhotos = {max_photos};
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {{
+            renderObservations();
+            updateCSV();
+            updateStats();
+        }});
+
+        function renderObservations() {{
+            const tbody = document.getElementById('observations-body');
+            tbody.innerHTML = '';
+
+            observations.forEach((obs, index) => {{
+                const tr = document.createElement('tr');
+
+                // Checkbox
+                const tdCheckbox = document.createElement('td');
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.className = 'obs-checkbox';
+                checkbox.checked = true;
+                checkbox.id = `obs-${{index}}`;
+                checkbox.addEventListener('change', handleCheckboxChange);
+                tdCheckbox.appendChild(checkbox);
+                tr.appendChild(tdCheckbox);
+
+                // Photo preview
+                const tdPhoto = document.createElement('td');
+                if (obs.photo_path) {{
+                    const img = document.createElement('img');
+                    img.src = obs.photo_path;
+                    img.className = 'photo-preview';
+                    img.alt = 'Observation photo';
+                    img.onclick = () => openModal(obs.photo_path);
+                    tdPhoto.appendChild(img);
+                }} else {{
+                    const noPhoto = document.createElement('div');
+                    noPhoto.className = 'no-photo';
+                    noPhoto.textContent = 'No photo';
+                    tdPhoto.appendChild(noPhoto);
+                }}
+                tr.appendChild(tdPhoto);
+
+                // Observation ID
+                const tdId = document.createElement('td');
+                const link = document.createElement('a');
+                link.href = obs.url;
+                link.target = '_blank';
+                link.textContent = obs.observation_id;
+                tdId.appendChild(link);
+                tr.appendChild(tdId);
+
+                // Date
+                const tdDate = document.createElement('td');
+                tdDate.textContent = obs.observed_on || 'Unknown';
+                tr.appendChild(tdDate);
+
+                // Species
+                const tdSpecies = document.createElement('td');
+                const speciesDiv = document.createElement('div');
+                const scientificName = document.createElement('div');
+                scientificName.style.fontStyle = 'italic';
+                scientificName.textContent = obs.scientific_name || 'Unknown';
+                speciesDiv.appendChild(scientificName);
+                if (obs.common_name) {{
+                    const commonName = document.createElement('div');
+                    commonName.style.fontSize = '12px';
+                    commonName.style.color = '#666';
+                    commonName.textContent = obs.common_name;
+                    speciesDiv.appendChild(commonName);
+                }}
+                tdSpecies.appendChild(speciesDiv);
+                tr.appendChild(tdSpecies);
+
+                // Location
+                const tdLocation = document.createElement('td');
+                const locationDiv = document.createElement('div');
+                if (obs.location) {{
+                    locationDiv.textContent = obs.location;
+                }}
+                if (obs.latitude && obs.longitude) {{
+                    const coords = document.createElement('div');
+                    coords.style.fontSize = '11px';
+                    coords.style.color = '#999';
+                    coords.textContent = `${{obs.latitude}}, ${{obs.longitude}}`;
+                    locationDiv.appendChild(coords);
+                }}
+                tdLocation.appendChild(locationDiv);
+                tr.appendChild(tdLocation);
+
+                // Observer
+                const tdObserver = document.createElement('td');
+                tdObserver.textContent = obs.observer || 'Unknown';
+                tr.appendChild(tdObserver);
+
+                // Quality grade
+                const tdQuality = document.createElement('td');
+                const qualityBadge = document.createElement('span');
+                qualityBadge.className = `quality-badge quality-${{obs.quality_grade}}`;
+                qualityBadge.textContent = obs.quality_grade || 'unknown';
+                tdQuality.appendChild(qualityBadge);
+                tr.appendChild(tdQuality);
+
+                // Photo count
+                const tdPhotoCount = document.createElement('td');
+                tdPhotoCount.textContent = obs.photo_count;
+                tr.appendChild(tdPhotoCount);
+
+                tbody.appendChild(tr);
+            }});
+        }}
+
+        function handleCheckboxChange() {{
+            updateStats();
+            updateCSV();
+        }}
+
+        function updateStats() {{
+            const total = observations.length;
+            const selected = getSelectedObservations().length;
+
+            document.getElementById('total-count').textContent = total;
+            document.getElementById('selected-count').textContent = selected;
+        }}
+
+        function getSelectedObservations() {{
+            const selected = [];
+            observations.forEach((obs, index) => {{
+                const checkbox = document.getElementById(`obs-${{index}}`);
+                if (checkbox && checkbox.checked) {{
+                    selected.push(obs);
+                }}
+            }});
+            return selected;
+        }}
+
+        function selectAll() {{
+            observations.forEach((obs, index) => {{
+                const checkbox = document.getElementById(`obs-${{index}}`);
+                if (checkbox) checkbox.checked = true;
+            }});
+            updateStats();
+            updateCSV();
+        }}
+
+        function deselectAll() {{
+            observations.forEach((obs, index) => {{
+                const checkbox = document.getElementById(`obs-${{index}}`);
+                if (checkbox) checkbox.checked = false;
+            }});
+            updateStats();
+            updateCSV();
+        }}
+
+        function updateCSV() {{
+            const selected = getSelectedObservations();
+            const csv = generateCSV(selected);
+            document.getElementById('csv-output').textContent = csv;
+        }}
+
+        function generateCSV(data) {{
+            if (data.length === 0) {{
+                return 'No observations selected';
+            }}
+
+            // Build header
+            const headers = [
+                'observation_id',
+                'observed_on',
+                'Encounter.year',
+                'Encounter.month',
+                'Encounter.day',
+                'scientific_name',
+                'Encounter.genus',
+                'Encounter.specificEpithet',
+                'common_name',
+                'Encounter.decimalLatitude',
+                'Encounter.decimalLongitude',
+                'Encounter.verbatimLocality',
+                'Encounter.livingStatus',
+                'observer',
+                'quality_grade',
+                'url',
+                'Encounter.researcherComments',
+                'photo_count',
+                'photo_filenames'
+            ];
+
+            // Add photo asset columns
+            for (let i = 0; i < maxPhotos; i++) {{
+                headers.push(`Encounter.mediaAsset${{i}}`);
+                headers.push(`Encounter.mediaAsset${{i}}.license`);
+            }}
+
+            const rows = [headers.join(',')];
+
+            // Add data rows
+            data.forEach(obs => {{
+                const row = [
+                    escapeCSV(obs.observation_id),
+                    escapeCSV(obs.observed_on),
+                    escapeCSV(obs.year),
+                    escapeCSV(obs.month),
+                    escapeCSV(obs.day),
+                    escapeCSV(obs.scientific_name),
+                    escapeCSV(obs.genus),
+                    escapeCSV(obs.specific_epithet),
+                    escapeCSV(obs.common_name),
+                    escapeCSV(obs.latitude),
+                    escapeCSV(obs.longitude),
+                    escapeCSV(obs.location),
+                    escapeCSV(obs.living_status),
+                    escapeCSV(obs.observer),
+                    escapeCSV(obs.quality_grade),
+                    escapeCSV(obs.url),
+                    escapeCSV(obs.researcher_comments),
+                    escapeCSV(obs.photo_count),
+                    escapeCSV(obs.photo_filenames)
+                ];
+
+                // Add photo assets and licenses
+                for (let i = 0; i < maxPhotos; i++) {{
+                    row.push(escapeCSV(obs.photos[i]));
+                    row.push(escapeCSV(obs.licenses[i]));
+                }}
+
+                rows.push(row.join(','));
+            }});
+
+            return rows.join('\\n');
+        }}
+
+        function escapeCSV(value) {{
+            if (value === null || value === undefined) {{
+                return '';
+            }}
+            const str = String(value);
+            if (str.includes(',') || str.includes('"') || str.includes('\\n')) {{
+                return '"' + str.replace(/"/g, '""') + '"';
+            }}
+            return str;
+        }}
+
+        function copyCSV() {{
+            const csv = document.getElementById('csv-output').textContent;
+            navigator.clipboard.writeText(csv).then(() => {{
+                const success = document.getElementById('copy-success');
+                success.classList.add('show');
+                setTimeout(() => {{
+                    success.classList.remove('show');
+                }}, 3000);
+            }});
+        }}
+
+        function downloadCSV() {{
+            const csv = document.getElementById('csv-output').textContent;
+            const blob = new Blob([csv], {{ type: 'text/csv' }});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'inat_observations_export.csv';
+            a.click();
+            URL.revokeObjectURL(url);
+        }}
+
+        function switchTab(tabName) {{
+            // Update tab buttons
+            document.querySelectorAll('.tab').forEach(tab => {{
+                tab.classList.remove('active');
+            }});
+            event.target.classList.add('active');
+
+            // Update tab content
+            document.querySelectorAll('.tab-content').forEach(content => {{
+                content.classList.remove('active');
+            }});
+            document.getElementById(tabName + '-tab').classList.add('active');
+        }}
+
+        function openModal(imageSrc) {{
+            const modal = document.getElementById('photo-modal');
+            const modalImg = document.getElementById('modal-image');
+            modal.classList.add('show');
+            modalImg.src = imageSrc;
+        }}
+
+        function closeModal() {{
+            document.getElementById('photo-modal').classList.remove('show');
+        }}
+    </script>
+</body>
+</html>
+'''
+
     def run(self):
         """Main execution method."""
         print("=" * 60)
@@ -440,11 +1180,16 @@ class iNaturalistDownloader:
             processed_data = self.process_observations(observations, species_name)
             all_observations_data.extend(processed_data)
 
-        # Write to CSV
+        # Write to CSV or HTML
         if all_observations_data:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            csv_filename = f"inat_observations_{timestamp}.csv"
-            self.write_csv(all_observations_data, csv_filename)
+
+            if self.html_review:
+                html_filename = f"inat_observations_review_{timestamp}.html"
+                self.write_html(all_observations_data, html_filename)
+            else:
+                csv_filename = f"inat_observations_{timestamp}.csv"
+                self.write_csv(all_observations_data, csv_filename)
 
             print("\n" + "=" * 60)
             print("Download complete!")
@@ -463,6 +1208,9 @@ def main():
 Examples:
   # Download last 30 days of leafy and weedy seadragon observations
   %(prog)s --species "Phycodurus eques" "Phyllopteryx taeniolatus" --days 30 --output ./seadragon_data
+
+  # Generate interactive HTML review page for manual observation selection
+  %(prog)s --species "leafy seadragon" --days 7 --html-review --output ./data
 
   # Download last 7 days of leafy seadragons with 2 second rate limit
   %(prog)s --species "leafy seadragon" --days 7 --rate-limit 2.0 --output ./data
@@ -500,6 +1248,12 @@ Examples:
         help='Seconds to wait between iNaturalist API calls (default: 1.0)'
     )
 
+    parser.add_argument(
+        '--html-review',
+        action='store_true',
+        help='Generate interactive HTML review page instead of CSV (allows manual selection of observations)'
+    )
+
     args = parser.parse_args()
 
     # Validate inputs
@@ -516,7 +1270,8 @@ Examples:
         output_dir=args.output,
         days_back=args.days,
         species_list=args.species,
-        rate_limit=args.rate_limit
+        rate_limit=args.rate_limit,
+        html_review=args.html_review
     )
 
     try:
