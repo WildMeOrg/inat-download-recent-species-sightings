@@ -442,6 +442,13 @@ class iNaturalistDownloader:
                     # Create relative path from HTML file to photo
                     photo_path = f"photos/{photo_list[0]}"
 
+            # Build array of all photo paths for gallery
+            all_photo_paths = []
+            for photo_filename in photo_list:
+                photo_file_path = self.photos_dir / photo_filename
+                if photo_file_path.exists():
+                    all_photo_paths.append(f"photos/{photo_filename}")
+
             # Build observation object
             obs_data = {
                 'observation_id': row.get('observation_id'),
@@ -464,6 +471,7 @@ class iNaturalistDownloader:
                 'photo_count': len(photo_list),
                 'photo_filenames': '; '.join(photo_list),
                 'photo_path': photo_path,
+                'all_photo_paths': all_photo_paths,
                 'photos': [],
                 'licenses': []
             }
@@ -753,7 +761,7 @@ class iNaturalistDownloader:
             top: 0;
             width: 100%;
             height: 100%;
-            background: rgba(0,0,0,0.8);
+            background: rgba(0,0,0,0.9);
             align-items: center;
             justify-content: center;
         }}
@@ -762,9 +770,19 @@ class iNaturalistDownloader:
             display: flex;
         }}
 
-        .modal-content {{
+        .modal-gallery {{
+            position: relative;
             max-width: 90%;
             max-height: 90%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }}
+
+        .modal-image {{
+            max-width: 100%;
+            max-height: 80vh;
+            object-fit: contain;
         }}
 
         .modal-close {{
@@ -775,6 +793,69 @@ class iNaturalistDownloader:
             font-size: 40px;
             font-weight: bold;
             cursor: pointer;
+            z-index: 1001;
+        }}
+
+        .modal-nav {{
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border: none;
+            font-size: 30px;
+            padding: 20px;
+            cursor: pointer;
+            transition: background 0.2s;
+            z-index: 1001;
+        }}
+
+        .modal-nav:hover {{
+            background: rgba(255,255,255,0.3);
+        }}
+
+        .modal-nav-prev {{
+            left: 20px;
+        }}
+
+        .modal-nav-next {{
+            right: 20px;
+        }}
+
+        .modal-counter {{
+            color: white;
+            margin-top: 15px;
+            font-size: 16px;
+            background: rgba(0,0,0,0.5);
+            padding: 8px 16px;
+            border-radius: 5px;
+        }}
+
+        .modal-thumbnails {{
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+            overflow-x: auto;
+            max-width: 90vw;
+            padding: 10px;
+        }}
+
+        .modal-thumbnail {{
+            width: 60px;
+            height: 60px;
+            object-fit: cover;
+            cursor: pointer;
+            border: 2px solid transparent;
+            border-radius: 4px;
+            transition: border-color 0.2s, transform 0.2s;
+        }}
+
+        .modal-thumbnail:hover {{
+            transform: scale(1.1);
+        }}
+
+        .modal-thumbnail.active {{
+            border-color: #2c7a3f;
         }}
     </style>
 </head>
@@ -842,9 +923,15 @@ class iNaturalistDownloader:
         </div>
     </div>
 
-    <div id="photo-modal" class="modal" onclick="closeModal()">
-        <span class="modal-close">&times;</span>
-        <img class="modal-content" id="modal-image">
+    <div id="photo-modal" class="modal" onclick="closeModal(event)">
+        <span class="modal-close" onclick="closeModal(event)">&times;</span>
+        <button class="modal-nav modal-nav-prev" onclick="prevImage(event)" id="modal-prev">&lt;</button>
+        <button class="modal-nav modal-nav-next" onclick="nextImage(event)" id="modal-next">&gt;</button>
+        <div class="modal-gallery" onclick="event.stopPropagation()">
+            <img class="modal-image" id="modal-image">
+            <div class="modal-counter" id="modal-counter"></div>
+            <div class="modal-thumbnails" id="modal-thumbnails"></div>
+        </div>
     </div>
 
     <script>
@@ -884,7 +971,7 @@ class iNaturalistDownloader:
                     img.src = obs.photo_path;
                     img.className = 'photo-preview';
                     img.alt = 'Observation photo';
-                    img.onclick = () => openModal(obs.photo_path);
+                    img.onclick = () => openModal(obs.all_photo_paths, 0);
                     tdPhoto.appendChild(img);
                 }} else {{
                     const noPhoto = document.createElement('div');
@@ -1130,16 +1217,124 @@ class iNaturalistDownloader:
             document.getElementById(tabName + '-tab').classList.add('active');
         }}
 
-        function openModal(imageSrc) {{
+        // Gallery state
+        let currentGallery = [];
+        let currentImageIndex = 0;
+
+        function openModal(imagePaths, startIndex = 0) {{
+            if (!imagePaths || imagePaths.length === 0) return;
+
+            currentGallery = imagePaths;
+            currentImageIndex = startIndex;
+
             const modal = document.getElementById('photo-modal');
-            const modalImg = document.getElementById('modal-image');
             modal.classList.add('show');
-            modalImg.src = imageSrc;
+
+            updateModalImage();
+            renderThumbnails();
+            updateNavButtons();
         }}
 
-        function closeModal() {{
+        function closeModal(event) {{
+            if (event) event.stopPropagation();
             document.getElementById('photo-modal').classList.remove('show');
+            currentGallery = [];
+            currentImageIndex = 0;
         }}
+
+        function nextImage(event) {{
+            event.stopPropagation();
+            if (currentImageIndex < currentGallery.length - 1) {{
+                currentImageIndex++;
+                updateModalImage();
+                updateNavButtons();
+            }}
+        }}
+
+        function prevImage(event) {{
+            event.stopPropagation();
+            if (currentImageIndex > 0) {{
+                currentImageIndex--;
+                updateModalImage();
+                updateNavButtons();
+            }}
+        }}
+
+        function goToImage(index, event) {{
+            event.stopPropagation();
+            currentImageIndex = index;
+            updateModalImage();
+            updateNavButtons();
+        }}
+
+        function updateModalImage() {{
+            const modalImg = document.getElementById('modal-image');
+            const counter = document.getElementById('modal-counter');
+
+            modalImg.src = currentGallery[currentImageIndex];
+            counter.textContent = `${{currentImageIndex + 1}} / ${{currentGallery.length}}`;
+
+            // Update active thumbnail
+            document.querySelectorAll('.modal-thumbnail').forEach((thumb, idx) => {{
+                if (idx === currentImageIndex) {{
+                    thumb.classList.add('active');
+                }} else {{
+                    thumb.classList.remove('active');
+                }}
+            }});
+        }}
+
+        function renderThumbnails() {{
+            const container = document.getElementById('modal-thumbnails');
+            container.innerHTML = '';
+
+            currentGallery.forEach((imgPath, index) => {{
+                const thumb = document.createElement('img');
+                thumb.src = imgPath;
+                thumb.className = 'modal-thumbnail';
+                if (index === currentImageIndex) {{
+                    thumb.classList.add('active');
+                }}
+                thumb.onclick = (e) => goToImage(index, e);
+                container.appendChild(thumb);
+            }});
+        }}
+
+        function updateNavButtons() {{
+            const prevBtn = document.getElementById('modal-prev');
+            const nextBtn = document.getElementById('modal-next');
+
+            // Hide buttons if only one image
+            if (currentGallery.length <= 1) {{
+                prevBtn.style.display = 'none';
+                nextBtn.style.display = 'none';
+            }} else {{
+                prevBtn.style.display = 'block';
+                nextBtn.style.display = 'block';
+
+                // Disable prev button on first image
+                prevBtn.style.opacity = currentImageIndex === 0 ? '0.3' : '1';
+                prevBtn.style.cursor = currentImageIndex === 0 ? 'default' : 'pointer';
+
+                // Disable next button on last image
+                nextBtn.style.opacity = currentImageIndex === currentGallery.length - 1 ? '0.3' : '1';
+                nextBtn.style.cursor = currentImageIndex === currentGallery.length - 1 ? 'default' : 'pointer';
+            }}
+        }}
+
+        // Keyboard navigation
+        document.addEventListener('keydown', function(event) {{
+            const modal = document.getElementById('photo-modal');
+            if (modal.classList.contains('show')) {{
+                if (event.key === 'ArrowLeft') {{
+                    prevImage(event);
+                }} else if (event.key === 'ArrowRight') {{
+                    nextImage(event);
+                }} else if (event.key === 'Escape') {{
+                    closeModal(event);
+                }}
+            }}
+        }});
     </script>
 </body>
 </html>
