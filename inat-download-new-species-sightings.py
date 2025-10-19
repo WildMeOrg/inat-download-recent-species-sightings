@@ -25,7 +25,7 @@ class iNaturalistDownloader:
 
     BASE_URL = "https://api.inaturalist.org/v1"
 
-    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False):
+    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None):
         """
         Initialize the downloader.
 
@@ -35,12 +35,17 @@ class iNaturalistDownloader:
             species_list: List of species names to search for
             rate_limit: Seconds to wait between API calls (default: 1.0)
             html_review: Generate interactive HTML review instead of CSV (default: False)
+            place: Optional place name to filter observations (e.g., "California", "Oregon", "United States")
+            location_id: Optional location ID to add to all observations in Encounter.locationID column
         """
         self.output_dir = Path(output_dir)
         self.days_back = days_back
         self.species_list = species_list
         self.rate_limit = rate_limit
         self.html_review = html_review
+        self.place = place
+        self.place_id = None
+        self.location_id = location_id
         self.photos_dir = self.output_dir / "photos"
 
         # Create directories if they don't exist
@@ -93,6 +98,64 @@ class iNaturalistDownloader:
             print(f"  Error searching for species '{species_name}': {e}")
             return None
 
+    def resolve_place(self, place_name: str) -> int:
+        """
+        Resolve a place name to a place ID, preferring political boundaries.
+
+        Args:
+            place_name: Name of the place (e.g., "California", "Oregon", "United States")
+
+        Returns:
+            Place ID, or None if not found
+        """
+        print(f"Resolving place: {place_name}")
+
+        params = urllib.parse.urlencode({'q': place_name})
+        url = f"{self.BASE_URL}/places/autocomplete?{params}"
+
+        try:
+            with urllib.request.urlopen(url) as response:
+                data = json.loads(response.read().decode())
+
+            # Rate limiting
+            time.sleep(self.rate_limit)
+
+            places = data.get('results', [])
+
+            if not places:
+                print(f"  Warning: No places found for '{place_name}'")
+                return None
+
+            # Prioritize places by type (countries, states, counties, provinces)
+            priority_types = ["country", "state", "county", "province"]
+
+            for place_type in priority_types:
+                for place in places:
+                    if place.get("place_type") == place_type and place_name.lower() in place.get("name", "").lower():
+                        place_id = place["id"]
+                        display_name = place.get("display_name", place.get("name"))
+                        print(f"  Found: {display_name} (ID: {place_id}, Type: {place_type})")
+                        return place_id
+
+            # If no priority match, return the first exact name match
+            for place in places:
+                if place.get("name", "").lower() == place_name.lower():
+                    place_id = place["id"]
+                    display_name = place.get("display_name", place.get("name"))
+                    print(f"  Found: {display_name} (ID: {place_id})")
+                    return place_id
+
+            # If no exact match, return the first result
+            first_place = places[0]
+            place_id = first_place["id"]
+            display_name = first_place.get("display_name", first_place.get("name"))
+            print(f"  Found (first result): {display_name} (ID: {place_id})")
+            return place_id
+
+        except Exception as e:
+            print(f"  Error resolving place '{place_name}': {e}")
+            return None
+
     def get_observations(self, taxon_id: int) -> List[Dict[Any, Any]]:
         """
         Get observations for a specific taxon ID within the date range.
@@ -112,7 +175,7 @@ class iNaturalistDownloader:
         per_page = 200  # Max allowed by API
 
         while True:
-            params = urllib.parse.urlencode({
+            params_dict = {
                 'taxon_id': taxon_id,
                 'd1': start_date,
                 'd2': end_date,
@@ -121,7 +184,13 @@ class iNaturalistDownloader:
                 'per_page': per_page,
                 'page': page,
                 'order_by': 'observed_on'
-            })
+            }
+
+            # Add place_id if it was specified
+            if self.place_id is not None:
+                params_dict['place_id'] = self.place_id
+
+            params = urllib.parse.urlencode(params_dict)
 
             url = f"{self.BASE_URL}/observations?{params}"
 
@@ -318,6 +387,7 @@ class iNaturalistDownloader:
                 'Encounter.decimalLatitude': latitude,
                 'Encounter.decimalLongitude': longitude,
                 'Encounter.verbatimLocality': place_guess,
+                'Encounter.locationID': self.location_id if self.location_id else None,
                 'Encounter.livingStatus': living_status,
                 'observer': observer,
                 'quality_grade': quality_grade,
@@ -383,6 +453,7 @@ class iNaturalistDownloader:
             'Encounter.decimalLatitude',
             'Encounter.decimalLongitude',
             'Encounter.verbatimLocality',
+            'Encounter.locationID',
             'Encounter.livingStatus',
             'observer',
             'quality_grade',
@@ -1348,9 +1419,19 @@ class iNaturalistDownloader:
         print(f"Output directory: {self.output_dir}")
         print(f"Date range: Last {self.days_back} days")
         print(f"Species: {', '.join(self.species_list)}")
+        if self.place:
+            print(f"Place filter: {self.place}")
         print(f"API rate limit: {self.rate_limit} seconds between calls")
         print("=" * 60)
         print()
+
+        # Resolve place if specified
+        if self.place:
+            self.place_id = self.resolve_place(self.place)
+            if self.place_id is None:
+                print("\nError: Could not resolve place. Exiting.")
+                sys.exit(1)
+            print()
 
         all_observations_data = []
 
@@ -1404,8 +1485,14 @@ Examples:
   # Download last 30 days of leafy and weedy seadragon observations
   %(prog)s --species "Phycodurus eques" "Phyllopteryx taeniolatus" --days 30 --output ./seadragon_data
 
+  # Filter observations to California only
+  %(prog)s --species "leafy seadragon" --days 60 --place "California" --output ./data
+
   # Generate interactive HTML review page for manual observation selection
   %(prog)s --species "leafy seadragon" --days 7 --html-review --output ./data
+
+  # Filter by place and use HTML review mode
+  %(prog)s --species "leafy seadragon" --days 60 --place "Oregon" --html-review --output ./data
 
   # Download last 7 days of leafy seadragons with 2 second rate limit
   %(prog)s --species "leafy seadragon" --days 7 --rate-limit 2.0 --output ./data
@@ -1449,6 +1536,20 @@ Examples:
         help='Generate interactive HTML review page instead of CSV (allows manual selection of observations)'
     )
 
+    parser.add_argument(
+        '--place',
+        type=str,
+        default=None,
+        help='Filter observations by place (e.g., "California", "Oregon", "United States")'
+    )
+
+    parser.add_argument(
+        '--use-locationID',
+        type=str,
+        default=None,
+        help='Location ID to add to Encounter.locationID column for all observations'
+    )
+
     args = parser.parse_args()
 
     # Validate inputs
@@ -1466,7 +1567,9 @@ Examples:
         days_back=args.days,
         species_list=args.species,
         rate_limit=args.rate_limit,
-        html_review=args.html_review
+        html_review=args.html_review,
+        place=args.place,
+        location_id=args.use_locationID
     )
 
     try:

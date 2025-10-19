@@ -6,11 +6,13 @@ A Python utility for downloading recent observations of specific species from iN
 
 - Downloads observations from iNaturalist for specified species
 - Configurable time range (number of days back)
+- Geographic filtering by place (country, state, county, etc.)
 - Downloads all photos associated with each observation
 - **Two output modes:**
   - **CSV mode**: Direct export to CSV for immediate bulk import
   - **Interactive HTML review**: Visual review interface to select high-quality observations before export
 - Includes observation metadata: date, location, observer, quality grade, etc.
+- Custom location ID assignment for Wildbook bulk import
 - Handles pagination automatically for large result sets
 - Uses only Python standard library (no external dependencies)
 
@@ -47,6 +49,8 @@ python3 inat-download-new-species-sightings.py --species SPECIES_NAME [OPTIONS]
 - `--output`: Output directory for CSV and photos (default: ./inat_data)
 - `--rate-limit`: Seconds to wait between iNaturalist API calls (default: 1.0)
 - `--html-review`: Generate interactive HTML review page instead of direct CSV export
+- `--place`: Filter observations by place (e.g., "California", "Oregon", "United States")
+- `--use-locationID`: Location ID to add to Encounter.locationID column for all observations
 
 ### Examples
 
@@ -112,6 +116,51 @@ python3 inat-download-new-species-sightings.py \
   --output ./data
 ```
 
+#### Filter observations by geographic location
+
+```bash
+# Download only observations from California
+python3 inat-download-new-species-sightings.py \
+  --species "leafy seadragon" \
+  --days 60 \
+  --place "California" \
+  --output ./data
+
+# Download only observations from Oregon
+python3 inat-download-new-species-sightings.py \
+  --species "weedy seadragon" \
+  --days 30 \
+  --place "Oregon" \
+  --output ./data
+
+# Combine with HTML review mode
+python3 inat-download-new-species-sightings.py \
+  --species "leafy seadragon" \
+  --days 60 \
+  --place "California" \
+  --html-review \
+  --output ./data
+```
+
+#### Add a location ID to all observations
+
+```bash
+# Add a custom location ID to the Encounter.locationID column
+python3 inat-download-new-species-sightings.py \
+  --species "leafy seadragon" \
+  --days 30 \
+  --use-locationID "AquariumOfThePacific" \
+  --output ./data
+
+# Combine place filter with location ID
+python3 inat-download-new-species-sightings.py \
+  --species "weedy seadragon" \
+  --days 60 \
+  --place "California" \
+  --use-locationID "CA-Coast-001" \
+  --output ./data
+```
+
 ## Output Structure
 
 ### CSV Mode (default)
@@ -166,6 +215,7 @@ The CSV file contains the following columns:
 | Encounter.decimalLatitude | Latitude coordinate in decimal degrees |
 | Encounter.decimalLongitude | Longitude coordinate in decimal degrees |
 | Encounter.verbatimLocality | Location description as entered by observer |
+| Encounter.locationID | Custom location ID (set via --use-locationID) |
 | Encounter.livingStatus | Living status of organism ("alive", "dead", or empty) |
 | observer | iNaturalist username of observer |
 | quality_grade | Quality grade (research, needs_id, casual) |
