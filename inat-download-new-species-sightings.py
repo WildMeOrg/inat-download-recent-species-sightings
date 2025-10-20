@@ -524,6 +524,10 @@ class iNaturalistDownloader:
                 if photo_file_path.exists():
                     all_photo_paths.append(f"photos/{photo_filename}")
 
+            # Get unique licenses for display
+            unique_licenses = list(set([lic for lic in license_list if lic]))
+            license_display = ', '.join(unique_licenses) if unique_licenses else 'No license'
+
             # Build observation object
             obs_data = {
                 'observation_id': row.get('observation_id'),
@@ -547,6 +551,7 @@ class iNaturalistDownloader:
                 'researcher_comments': row.get('Encounter.researcherComments'),
                 'photo_count': len(photo_list),
                 'photo_filenames': '; '.join(photo_list),
+                'license_display': license_display,
                 'photo_path': photo_path,
                 'all_photo_paths': all_photo_paths,
                 'photos': [],
@@ -977,6 +982,7 @@ class iNaturalistDownloader:
                             <th>Location</th>
                             <th>Observer</th>
                             <th>Quality</th>
+                            <th>License</th>
                             <th>Photos</th>
                         </tr>
                     </thead>
@@ -1117,6 +1123,12 @@ class iNaturalistDownloader:
                 qualityBadge.textContent = obs.quality_grade || 'unknown';
                 tdQuality.appendChild(qualityBadge);
                 tr.appendChild(tdQuality);
+
+                // License
+                const tdLicense = document.createElement('td');
+                tdLicense.textContent = obs.license_display || 'No license';
+                tdLicense.style.fontSize = '11px';
+                tr.appendChild(tdLicense);
 
                 // Photo count
                 const tdPhotoCount = document.createElement('td');
