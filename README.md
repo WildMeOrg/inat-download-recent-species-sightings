@@ -12,7 +12,7 @@ A Python utility for downloading recent observations of specific species from iN
   - **CSV mode**: Direct export to CSV for immediate bulk import
   - **Interactive HTML review**: Visual review interface to select high-quality observations before export
 - Includes observation metadata: date, location, observer, quality grade, etc.
-- Custom location ID assignment for Wildbook bulk import
+- Custom location ID and submitter ID assignment for Wildbook bulk import
 - Handles pagination automatically for large result sets
 - Uses only Python standard library (no external dependencies)
 
@@ -51,6 +51,7 @@ python3 inat-download-new-species-sightings.py --species SPECIES_NAME [OPTIONS]
 - `--html-review`: Generate interactive HTML review page instead of direct CSV export
 - `--place`: Filter observations by place (e.g., "California", "Oregon", "United States")
 - `--use-locationID`: Location ID to add to Encounter.locationID column for all observations
+- `--use-submitterID`: Submitter ID to add to Encounter.submitterID column for all observations
 
 ### Examples
 
@@ -161,6 +162,26 @@ python3 inat-download-new-species-sightings.py \
   --output ./data
 ```
 
+#### Add a submitter ID to all observations
+
+```bash
+# Add a custom submitter ID to the Encounter.submitterID column
+python3 inat-download-new-species-sightings.py \
+  --species "leafy seadragon" \
+  --days 30 \
+  --use-submitterID "researcher@example.org" \
+  --output ./data
+
+# Combine location ID and submitter ID
+python3 inat-download-new-species-sightings.py \
+  --species "weedy seadragon" \
+  --days 60 \
+  --place "California" \
+  --use-locationID "CA-Coast-001" \
+  --use-submitterID "researcher@example.org" \
+  --output ./data
+```
+
 ## Output Structure
 
 ### CSV Mode (default)
@@ -217,6 +238,7 @@ The CSV file contains the following columns:
 | Encounter.verbatimLocality | Location description as entered by observer |
 | Encounter.locationID | Custom location ID (set via --use-locationID) |
 | Encounter.livingStatus | Living status of organism ("alive", "dead", or empty) |
+| Encounter.submitterID | Custom submitter ID (set via --use-submitterID) |
 | observer | iNaturalist username of observer |
 | quality_grade | Quality grade (research, needs_id, casual) |
 | url | Link to observation on iNaturalist |

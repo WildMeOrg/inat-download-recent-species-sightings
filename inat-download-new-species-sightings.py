@@ -25,7 +25,7 @@ class iNaturalistDownloader:
 
     BASE_URL = "https://api.inaturalist.org/v1"
 
-    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None):
+    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None):
         """
         Initialize the downloader.
 
@@ -37,6 +37,7 @@ class iNaturalistDownloader:
             html_review: Generate interactive HTML review instead of CSV (default: False)
             place: Optional place name to filter observations (e.g., "California", "Oregon", "United States")
             location_id: Optional location ID to add to all observations in Encounter.locationID column
+            submitter_id: Optional submitter ID to add to all observations in Encounter.submitterID column
         """
         self.output_dir = Path(output_dir)
         self.days_back = days_back
@@ -46,6 +47,7 @@ class iNaturalistDownloader:
         self.place = place
         self.place_id = None
         self.location_id = location_id
+        self.submitter_id = submitter_id
         self.photos_dir = self.output_dir / "photos"
 
         # Create directories if they don't exist
@@ -389,6 +391,7 @@ class iNaturalistDownloader:
                 'Encounter.verbatimLocality': place_guess,
                 'Encounter.locationID': self.location_id if self.location_id else None,
                 'Encounter.livingStatus': living_status,
+                'Encounter.submitterID': self.submitter_id if self.submitter_id else None,
                 'observer': observer,
                 'quality_grade': quality_grade,
                 'url': obs_url,
@@ -455,6 +458,7 @@ class iNaturalistDownloader:
             'Encounter.verbatimLocality',
             'Encounter.locationID',
             'Encounter.livingStatus',
+            'Encounter.submitterID',
             'observer',
             'quality_grade',
             'url',
@@ -536,6 +540,7 @@ class iNaturalistDownloader:
                 'location': row.get('Encounter.verbatimLocality'),
                 'location_id': row.get('Encounter.locationID'),
                 'living_status': row.get('Encounter.livingStatus'),
+                'submitter_id': row.get('Encounter.submitterID'),
                 'observer': row.get('observer'),
                 'quality_grade': row.get('quality_grade'),
                 'url': row.get('url'),
@@ -1191,6 +1196,7 @@ class iNaturalistDownloader:
                 'Encounter.verbatimLocality',
                 'Encounter.locationID',
                 'Encounter.livingStatus',
+                'Encounter.submitterID',
                 'observer',
                 'quality_grade',
                 'url',
@@ -1224,6 +1230,7 @@ class iNaturalistDownloader:
                     escapeCSV(obs.location),
                     escapeCSV(obs.location_id),
                     escapeCSV(obs.living_status),
+                    escapeCSV(obs.submitter_id),
                     escapeCSV(obs.observer),
                     escapeCSV(obs.quality_grade),
                     escapeCSV(obs.url),
@@ -1553,6 +1560,13 @@ Examples:
         help='Location ID to add to Encounter.locationID column for all observations'
     )
 
+    parser.add_argument(
+        '--use-submitterID',
+        type=str,
+        default=None,
+        help='Submitter ID to add to Encounter.submitterID column for all observations'
+    )
+
     args = parser.parse_args()
 
     # Validate inputs
@@ -1572,7 +1586,8 @@ Examples:
         rate_limit=args.rate_limit,
         html_review=args.html_review,
         place=args.place,
-        location_id=args.use_locationID
+        location_id=args.use_locationID,
+        submitter_id=args.use_submitterID
     )
 
     try:
