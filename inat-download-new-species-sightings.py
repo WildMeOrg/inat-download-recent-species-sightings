@@ -1041,7 +1041,8 @@ class iNaturalistDownloader:
                 const checkbox = document.createElement('input');
                 checkbox.type = 'checkbox';
                 checkbox.className = 'obs-checkbox';
-                checkbox.checked = true;
+                // Default to checked only if observation has a license
+                checkbox.checked = obs.license_display !== 'No license';
                 checkbox.id = `obs-${{index}}`;
                 checkbox.addEventListener('change', handleCheckboxChange);
                 tdCheckbox.appendChild(checkbox);
