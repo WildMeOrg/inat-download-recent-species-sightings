@@ -169,7 +169,7 @@ python3 inat-download-new-species-sightings.py \
 python3 inat-download-new-species-sightings.py \
   --species "leafy seadragon" \
   --days 30 \
-  --use-submitterID "researcher@example.org" \
+  --use-submitterID "myWildbookUsername" \
   --output ./data
 
 # Combine location ID and submitter ID
@@ -178,7 +178,7 @@ python3 inat-download-new-species-sightings.py \
   --days 60 \
   --place "California" \
   --use-locationID "CA-Coast-001" \
-  --use-submitterID "researcher@example.org" \
+  --use-submitterID "myWildbookUsername" \
   --output ./data
 ```
 
