@@ -331,10 +331,6 @@ class iNaturalistDownloader:
                 if len(name_parts) >= 2:
                     encounter_specific_epithet = name_parts[1]
 
-            # Create researcher comments with download date and source URL
-            today_date = datetime.now().strftime("%Y-%m-%d")
-            researcher_comments = f"Observation downloaded from iNaturalist on {today_date}. Source: {obs_url}"
-
             # Parse annotations for living status
             living_status = 'alive'  # Default to 'alive'
             annotations = obs.get('annotations')
@@ -374,6 +370,19 @@ class iNaturalistDownloader:
                     if self.download_photo(photo_url, photo_filename):
                         photo_filenames.append(photo_filename)
                         photo_licenses.append(license_code)
+
+            # Create researcher comments with download date, source URL, and license info
+            today_date = datetime.now().strftime("%Y-%m-%d")
+            researcher_comments = f"Observation downloaded from iNaturalist on {today_date}.<br>Source: {obs_url}"
+
+            # Add license information to researcher comments
+            if photo_licenses:
+                unique_licenses = list(set([lic for lic in photo_licenses if lic]))
+                if unique_licenses:
+                    license_str = ', '.join(unique_licenses)
+                    researcher_comments += f"<br>License(s): {license_str}"
+                else:
+                    researcher_comments += "<br>License: None specified. Copyright applies."
 
             # Create row for CSV
             row = {
