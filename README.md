@@ -322,9 +322,6 @@ This could mean:
 
 This script uses the [iNaturalist API v1](https://api.inaturalist.org/v1/docs/), which is free and doesn't require authentication for basic queries.
 
-## License
-
-This script is provided as-is for scientific and conservation purposes.
 
 ## Support
 
