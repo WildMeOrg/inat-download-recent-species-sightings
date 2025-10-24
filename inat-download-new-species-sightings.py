@@ -18,6 +18,7 @@ import urllib.request
 import urllib.parse
 import json
 import time
+import uuid
 
 
 class iNaturalistDownloader:
@@ -25,7 +26,7 @@ class iNaturalistDownloader:
 
     BASE_URL = "https://api.inaturalist.org/v1"
 
-    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None):
+    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None, social_split: bool = False):
         """
         Initialize the downloader.
 
@@ -38,6 +39,7 @@ class iNaturalistDownloader:
             place: Optional place name to filter observations (e.g., "California", "Oregon", "United States")
             location_id: Optional location ID to add to all observations in Encounter.locationID column
             submitter_id: Optional submitter ID to add to all observations in Encounter.submitterID column
+            social_split: Split multi-photo observations into separate rows with shared sighting ID (default: False)
         """
         self.output_dir = Path(output_dir)
         self.days_back = days_back
@@ -48,6 +50,7 @@ class iNaturalistDownloader:
         self.place_id = None
         self.location_id = location_id
         self.submitter_id = submitter_id
+        self.social_split = social_split
         self.photos_dir = self.output_dir / "photos"
 
         # Create directories if they don't exist
@@ -384,34 +387,72 @@ class iNaturalistDownloader:
                 else:
                     researcher_comments += "<br>License: None specified. Copyright applies."
 
-            # Create row for CSV
-            row = {
-                'observation_id': obs_id,
-                'observed_on': observed_on,
-                'Encounter.year': encounter_year,
-                'Encounter.month': encounter_month,
-                'Encounter.day': encounter_day,
-                'scientific_name': scientific_name,
-                'Encounter.genus': encounter_genus,
-                'Encounter.specificEpithet': encounter_specific_epithet,
-                'common_name': common_name,
-                'Encounter.decimalLatitude': latitude,
-                'Encounter.decimalLongitude': longitude,
-                'Encounter.verbatimLocality': place_guess,
-                'Encounter.locationID': self.location_id if self.location_id else None,
-                'Encounter.livingStatus': living_status,
-                'Encounter.submitterID': self.submitter_id if self.submitter_id else None,
-                'observer': observer,
-                'quality_grade': quality_grade,
-                'url': obs_url,
-                'Encounter.researcherComments': researcher_comments,
-                'photo_count': len(photo_filenames),
-                'photo_filenames': '; '.join(photo_filenames),
-                '_photo_list': photo_filenames,  # Temporary field for photo processing
-                '_license_list': photo_licenses  # Temporary field for license processing
-            }
+            # If social_split is enabled and there are multiple photos, create one row per photo
+            if self.social_split and len(photo_filenames) > 1:
+                # Generate a common sighting ID for all photos from this observation
+                sighting_id = str(uuid.uuid4())
 
-            processed_data.append(row)
+                # Create one row for each photo
+                for photo_idx, (photo_filename, photo_license) in enumerate(zip(photo_filenames, photo_licenses)):
+                    row = {
+                        'observation_id': obs_id,
+                        'observed_on': observed_on,
+                        'Encounter.year': encounter_year,
+                        'Encounter.month': encounter_month,
+                        'Encounter.day': encounter_day,
+                        'scientific_name': scientific_name,
+                        'Encounter.genus': encounter_genus,
+                        'Encounter.specificEpithet': encounter_specific_epithet,
+                        'common_name': common_name,
+                        'Encounter.decimalLatitude': latitude,
+                        'Encounter.decimalLongitude': longitude,
+                        'Encounter.verbatimLocality': place_guess,
+                        'Encounter.locationID': self.location_id if self.location_id else None,
+                        'Encounter.livingStatus': living_status,
+                        'Encounter.submitterID': self.submitter_id if self.submitter_id else None,
+                        'observer': observer,
+                        'quality_grade': quality_grade,
+                        'url': obs_url,
+                        'Encounter.researcherComments': researcher_comments,
+                        'Sighting.sightingID': sighting_id,
+                        'photo_count': 1,  # Each row has one photo
+                        'photo_filenames': photo_filename,
+                        '_photo_list': [photo_filename],  # Single photo for this encounter
+                        '_license_list': [photo_license]  # Single license for this encounter
+                    }
+                    processed_data.append(row)
+            else:
+                # Original behavior: one row per observation
+                # Sighting ID only populated when social_split is enabled
+                sighting_id = str(uuid.uuid4()) if self.social_split and len(photo_filenames) >= 1 else None
+
+                row = {
+                    'observation_id': obs_id,
+                    'observed_on': observed_on,
+                    'Encounter.year': encounter_year,
+                    'Encounter.month': encounter_month,
+                    'Encounter.day': encounter_day,
+                    'scientific_name': scientific_name,
+                    'Encounter.genus': encounter_genus,
+                    'Encounter.specificEpithet': encounter_specific_epithet,
+                    'common_name': common_name,
+                    'Encounter.decimalLatitude': latitude,
+                    'Encounter.decimalLongitude': longitude,
+                    'Encounter.verbatimLocality': place_guess,
+                    'Encounter.locationID': self.location_id if self.location_id else None,
+                    'Encounter.livingStatus': living_status,
+                    'Encounter.submitterID': self.submitter_id if self.submitter_id else None,
+                    'observer': observer,
+                    'quality_grade': quality_grade,
+                    'url': obs_url,
+                    'Encounter.researcherComments': researcher_comments,
+                    'Sighting.sightingID': sighting_id,
+                    'photo_count': len(photo_filenames),
+                    'photo_filenames': '; '.join(photo_filenames),
+                    '_photo_list': photo_filenames,  # Temporary field for photo processing
+                    '_license_list': photo_licenses  # Temporary field for license processing
+                }
+                processed_data.append(row)
 
         return processed_data
 
@@ -468,6 +509,7 @@ class iNaturalistDownloader:
             'Encounter.locationID',
             'Encounter.livingStatus',
             'Encounter.submitterID',
+            'Sighting.sightingID',
             'observer',
             'quality_grade',
             'url',
@@ -554,6 +596,7 @@ class iNaturalistDownloader:
                 'location_id': row.get('Encounter.locationID'),
                 'living_status': row.get('Encounter.livingStatus'),
                 'submitter_id': row.get('Encounter.submitterID'),
+                'sighting_id': row.get('Sighting.sightingID'),
                 'observer': row.get('observer'),
                 'quality_grade': row.get('quality_grade'),
                 'url': row.get('url'),
@@ -1219,6 +1262,7 @@ class iNaturalistDownloader:
                 'Encounter.locationID',
                 'Encounter.livingStatus',
                 'Encounter.submitterID',
+                'Sighting.sightingID',
                 'observer',
                 'quality_grade',
                 'url',
@@ -1253,6 +1297,7 @@ class iNaturalistDownloader:
                     escapeCSV(obs.location_id),
                     escapeCSV(obs.living_status),
                     escapeCSV(obs.submitter_id),
+                    escapeCSV(obs.sighting_id),
                     escapeCSV(obs.observer),
                     escapeCSV(obs.quality_grade),
                     escapeCSV(obs.url),
@@ -1589,6 +1634,12 @@ Examples:
         help='Submitter ID to add to Encounter.submitterID column for all observations'
     )
 
+    parser.add_argument(
+        '--social-split-observations',
+        action='store_true',
+        help='Split multi-photo observations into separate rows (one per photo) with shared Sighting.sightingID for social species'
+    )
+
     args = parser.parse_args()
 
     # Validate inputs
@@ -1609,7 +1660,8 @@ Examples:
         html_review=args.html_review,
         place=args.place,
         location_id=args.use_locationID,
-        submitter_id=args.use_submitterID
+        submitter_id=args.use_submitterID,
+        social_split=args.social_split_observations
     )
 
     try:

@@ -329,3 +329,5 @@ This script is provided as-is for scientific and conservation purposes.
 ## Support
 
 For issues or questions, please check the iNaturalist API documentation or community forums.
+
+Copyright Conservation X Labs 2025.
