@@ -652,6 +652,11 @@ class iNaturalistDownloader:
         """Generate the HTML template with embedded JavaScript."""
         observations_json_str = json.dumps(observations, indent=2)
 
+        # Build filename components for CSV download
+        species_part = "_".join([s.replace(" ", "-") for s in self.species_list[:2]])
+        place_part = f"_{self.place.replace(' ', '-')}" if self.place else ""
+        date_part = datetime.now().strftime("%Y%m%d")
+
         return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1093,6 +1098,9 @@ class iNaturalistDownloader:
         const observations = {observations_json_str};
         const maxPhotos = {max_photos};
 
+        // Filename components for CSV export
+        const csvFilename = 'inat_observations_export_{species_part}{place_part}_{date_part}.csv';
+
         // Initialize
         document.addEventListener('DOMContentLoaded', function() {{
             renderObservations();
@@ -1387,7 +1395,7 @@ class iNaturalistDownloader:
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = 'inat_observations_export.csv';
+            a.download = csvFilename;
             a.click();
             URL.revokeObjectURL(url);
         }}
@@ -1578,11 +1586,15 @@ class iNaturalistDownloader:
         if all_observations_data:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+            # Build filename components
+            species_part = "_".join([s.replace(" ", "-") for s in self.species_list[:2]])  # Use first 2 species
+            place_part = f"_{self.place.replace(' ', '-')}" if self.place else ""
+
             if self.html_review:
-                html_filename = f"inat_observations_review_{timestamp}.html"
+                html_filename = f"inat_observations_review_{species_part}{place_part}_{timestamp}.html"
                 self.write_html(all_observations_data, html_filename)
             else:
-                csv_filename = f"inat_observations_{timestamp}.csv"
+                csv_filename = f"inat_observations_{species_part}{place_part}_{timestamp}.csv"
                 self.write_csv(all_observations_data, csv_filename)
 
             print("\n" + "=" * 60)
