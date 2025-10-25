@@ -305,6 +305,7 @@ The CSV file contains the following columns:
 | Encounter.locationID | Custom location ID (set via --use-locationID) |
 | Encounter.livingStatus | Living status of organism ("alive", "dead", or empty) |
 | Encounter.submitterID | Custom submitter ID (set via --use-submitterID) |
+| Encounter.state | Encounter approval state (always "unapproved" for new imports) |
 | Sighting.sightingID | UUID linking related encounters from same observation (only populated when --social-split-observations is used) |
 | observer | iNaturalist username of observer |
 | quality_grade | Quality grade (research, needs_id, casual) |
@@ -394,4 +395,4 @@ This script uses the [iNaturalist API v1](https://api.inaturalist.org/v1/docs/),
 
 For issues or questions, please check the iNaturalist API documentation or community forums.
 
-Copyright Conservation X Labs 2025.
+Copyright Conservation X Labs 2025. All rights reserved.
