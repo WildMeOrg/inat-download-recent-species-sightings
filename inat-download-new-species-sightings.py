@@ -1104,8 +1104,12 @@ class iNaturalistDownloader:
             // Sort observations: checked (selected) first, then unchecked
             const sortedObservations = observations.map((obs, index) => ({{ obs, index }}))
                 .sort((a, b) => {{
-                    const aChecked = a.obs.license_display !== 'No license' && !a.obs.has_non_organism_evidence;
-                    const bChecked = b.obs.license_display !== 'No license' && !b.obs.has_non_organism_evidence;
+                    const aChecked = a.obs.license_display !== 'No license' &&
+                                     !a.obs.has_non_organism_evidence &&
+                                     a.obs.quality_grade !== 'needs_id';
+                    const bChecked = b.obs.license_display !== 'No license' &&
+                                     !b.obs.has_non_organism_evidence &&
+                                     b.obs.quality_grade !== 'needs_id';
 
                     // Checked items (true) should come first
                     if (aChecked === bChecked) return 0;
@@ -1122,8 +1126,11 @@ class iNaturalistDownloader:
                 checkbox.className = 'obs-checkbox';
                 // Default to checked only if:
                 // 1. Observation has a license, AND
-                // 2. Evidence is NOT non-organism (track, scat, molt, etc.)
-                checkbox.checked = obs.license_display !== 'No license' && !obs.has_non_organism_evidence;
+                // 2. Evidence is NOT non-organism (track, scat, molt, etc.), AND
+                // 3. Quality grade is NOT "needs_id"
+                checkbox.checked = obs.license_display !== 'No license' &&
+                                   !obs.has_non_organism_evidence &&
+                                   obs.quality_grade !== 'needs_id';
                 checkbox.id = `obs-${{index}}`;
                 checkbox.addEventListener('change', handleCheckboxChange);
                 tdCheckbox.appendChild(checkbox);

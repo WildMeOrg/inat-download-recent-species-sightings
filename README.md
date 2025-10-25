@@ -13,6 +13,7 @@ A Python utility for downloading recent observations of specific species from iN
   - **Interactive HTML review**: Visual review interface to select high-quality observations before export
 - **Smart filtering for HTML mode:**
   - Auto-deselects observations without licenses (copyright protected)
+  - Auto-deselects "needs_id" quality grade (unconfirmed identifications)
   - Auto-deselects non-organism evidence (tracks, scat, molt, etc.)
   - Auto-sorts with valid observations at the top
   - License information prominently displayed in table
@@ -258,11 +259,12 @@ The HTML review interface automatically applies intelligent filtering to help yo
 
 **Auto-selected (checked by default):**
 - ✅ Observations with valid open licenses (CC-BY, CC0, CC-BY-NC, etc.)
-- ✅ Evidence type is "Organism" (actual animal sighting)
-- ✅ Evidence type is not specified
+- ✅ Evidence type is "Organism" (actual animal sighting) or not specified
+- ✅ Quality grade is "research" or "casual"
 
 **Auto-deselected (unchecked by default):**
 - ❌ Observations without licenses (copyright applies)
+- ❌ Quality grade is "needs_id" (identification not yet confirmed)
 - ❌ Observations with non-organism evidence types:
   - Track/Footprint
   - Scat/Feces
