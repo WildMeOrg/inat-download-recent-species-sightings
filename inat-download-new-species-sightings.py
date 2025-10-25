@@ -334,19 +334,31 @@ class iNaturalistDownloader:
                 if len(name_parts) >= 2:
                     encounter_specific_epithet = name_parts[1]
 
-            # Parse annotations for living status
+            # Parse annotations for living status and evidence of presence
             living_status = 'alive'  # Default to 'alive'
+            is_single_subject = False  # Track if observation has "single subject" annotation
+            has_non_organism_evidence = False  # Track if evidence is something other than organism
             annotations = obs.get('annotations')
             if annotations and isinstance(annotations, list):
                 for annotation in annotations:
                     if isinstance(annotation, dict):
                         controlled_value_id = annotation.get('controlled_value_id')
+                        controlled_attribute_id = annotation.get('controlled_attribute_id')
+
+                        # Living status annotation
                         if controlled_value_id == 19:
                             living_status = 'dead'
-                            break
                         elif controlled_value_id == 14:
                             living_status = 'alive'
-                            break
+
+                        # Evidence of Presence annotations (controlled_attribute_id == 22)
+                        if controlled_attribute_id == 22:
+                            # controlled_value_id 24 = "Organism" (single subject - good)
+                            if controlled_value_id == 24:
+                                is_single_subject = True
+                            # Any other value (track, scat, molt, etc.) should be deselected
+                            elif controlled_value_id is not None:
+                                has_non_organism_evidence = True
 
             # Download photos
             photos = obs.get('photos', [])
@@ -388,7 +400,8 @@ class iNaturalistDownloader:
                     researcher_comments += "<br>License: None specified. Copyright applies."
 
             # If social_split is enabled and there are multiple photos, create one row per photo
-            if self.social_split and len(photo_filenames) > 1:
+            # BUT only if the observation is NOT marked as single subject
+            if self.social_split and len(photo_filenames) > 1 and not is_single_subject:
                 # Generate a common sighting ID for all photos from this observation
                 sighting_id = str(uuid.uuid4())
 
@@ -418,7 +431,8 @@ class iNaturalistDownloader:
                         'photo_count': 1,  # Each row has one photo
                         'photo_filenames': photo_filename,
                         '_photo_list': [photo_filename],  # Single photo for this encounter
-                        '_license_list': [photo_license]  # Single license for this encounter
+                        '_license_list': [photo_license],  # Single license for this encounter
+                        '_has_non_organism_evidence': has_non_organism_evidence  # For HTML deselection
                     }
                     processed_data.append(row)
             else:
@@ -450,7 +464,8 @@ class iNaturalistDownloader:
                     'photo_count': len(photo_filenames),
                     'photo_filenames': '; '.join(photo_filenames),
                     '_photo_list': photo_filenames,  # Temporary field for photo processing
-                    '_license_list': photo_licenses  # Temporary field for license processing
+                    '_license_list': photo_licenses,  # Temporary field for license processing
+                    '_has_non_organism_evidence': has_non_organism_evidence  # For HTML deselection
                 }
                 processed_data.append(row)
 
@@ -604,6 +619,7 @@ class iNaturalistDownloader:
                 'photo_count': len(photo_list),
                 'photo_filenames': '; '.join(photo_list),
                 'license_display': license_display,
+                'has_non_organism_evidence': row.get('_has_non_organism_evidence', False),
                 'photo_path': photo_path,
                 'all_photo_paths': all_photo_paths,
                 'photos': [],
@@ -1085,7 +1101,18 @@ class iNaturalistDownloader:
             const tbody = document.getElementById('observations-body');
             tbody.innerHTML = '';
 
-            observations.forEach((obs, index) => {{
+            // Sort observations: checked (selected) first, then unchecked
+            const sortedObservations = observations.map((obs, index) => ({{ obs, index }}))
+                .sort((a, b) => {{
+                    const aChecked = a.obs.license_display !== 'No license' && !a.obs.has_non_organism_evidence;
+                    const bChecked = b.obs.license_display !== 'No license' && !b.obs.has_non_organism_evidence;
+
+                    // Checked items (true) should come first
+                    if (aChecked === bChecked) return 0;
+                    return aChecked ? -1 : 1;
+                }});
+
+            sortedObservations.forEach(({{obs, index}}) => {{
                 const tr = document.createElement('tr');
 
                 // Checkbox
@@ -1093,8 +1120,10 @@ class iNaturalistDownloader:
                 const checkbox = document.createElement('input');
                 checkbox.type = 'checkbox';
                 checkbox.className = 'obs-checkbox';
-                // Default to checked only if observation has a license
-                checkbox.checked = obs.license_display !== 'No license';
+                // Default to checked only if:
+                // 1. Observation has a license, AND
+                // 2. Evidence is NOT non-organism (track, scat, molt, etc.)
+                checkbox.checked = obs.license_display !== 'No license' && !obs.has_non_organism_evidence;
                 checkbox.id = `obs-${{index}}`;
                 checkbox.addEventListener('change', handleCheckboxChange);
                 tdCheckbox.appendChild(checkbox);

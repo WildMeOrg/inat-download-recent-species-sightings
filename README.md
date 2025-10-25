@@ -11,8 +11,15 @@ A Python utility for downloading recent observations of specific species from iN
 - **Two output modes:**
   - **CSV mode**: Direct export to CSV for immediate bulk import
   - **Interactive HTML review**: Visual review interface to select high-quality observations before export
+- **Smart filtering for HTML mode:**
+  - Auto-deselects observations without licenses (copyright protected)
+  - Auto-deselects non-organism evidence (tracks, scat, molt, etc.)
+  - Auto-sorts with valid observations at the top
+  - License information prominently displayed in table
 - Includes observation metadata: date, location, observer, quality grade, etc.
 - Custom location ID and submitter ID assignment for Wildbook bulk import
+- **Social species support**: Split multi-photo observations into separate encounters while preserving relationships via shared Sighting ID
+- Respects iNaturalist "single subject" annotations to prevent inappropriate splitting
 - Handles pagination automatically for large result sets
 - Uses only Python standard library (no external dependencies)
 
@@ -52,6 +59,7 @@ python3 inat-download-new-species-sightings.py --species SPECIES_NAME [OPTIONS]
 - `--place`: Filter observations by place (e.g., "California", "Oregon", "United States")
 - `--use-locationID`: Location ID to add to Encounter.locationID column for all observations
 - `--use-submitterID`: Submitter ID to add to Encounter.submitterID column for all observations
+- `--social-split-observations`: Split multi-photo observations into separate CSV rows (one per photo) for social species. Each photo becomes a separate Encounter, linked by a shared Sighting.sightingID. Respects iNaturalist "single subject" annotations.
 
 ### Examples
 
@@ -75,9 +83,11 @@ python3 inat-download-new-species-sightings.py \
 ```
 
 This creates an interactive HTML page where you can:
-- View photo thumbnails for each observation
-- Review observation metadata (date, location, quality grade, etc.)
+- View photo thumbnails for each observation (click to see full gallery)
+- Review observation metadata (date, location, quality grade, license, etc.)
 - Select/deselect observations using checkboxes
+- **Auto-filtering**: Observations without licenses or with non-organism evidence (tracks, scat, etc.) are automatically deselected
+- **Auto-sorting**: Valid observations appear at the top, excluded ones at the bottom
 - See the resulting CSV content update dynamically
 - Copy the CSV to clipboard or download it directly
 
@@ -182,6 +192,30 @@ python3 inat-download-new-species-sightings.py \
   --output ./data
 ```
 
+#### Split observations for social species
+
+For highly social species where multiple individuals may appear in the same observation, use `--social-split-observations` to create one Encounter per photo:
+
+```bash
+# Split multi-photo observations into separate encounters
+python3 inat-download-new-species-sightings.py \
+  --species "weedy seadragon" \
+  --days 30 \
+  --social-split-observations \
+  --output ./data
+```
+
+**How it works:**
+- Observations with multiple photos are split into separate CSV rows (one per photo)
+- Each row represents a single Encounter in Wildbook
+- All rows from the same observation share a common `Sighting.sightingID` UUID to preserve the relationship
+- Observations marked with iNaturalist's "single subject" annotation are NOT split (all photos kept together)
+- Single-photo observations remain as single rows
+
+**Example result:**
+- Original: 1 observation with 4 photos → 4 CSV rows (each with 1 photo, same Sighting.sightingID)
+- "Single subject" observation with 3 photos → 1 CSV row (all 3 photos together)
+
 ## Output Structure
 
 ### CSV Mode (default)
@@ -218,6 +252,36 @@ The HTML file can be opened in any web browser. It contains:
 
 **Note:** Keep the HTML file and `photos/` folder in the same directory for images to display correctly.
 
+#### Smart Filtering in HTML Mode
+
+The HTML review interface automatically applies intelligent filtering to help you focus on valid observations:
+
+**Auto-selected (checked by default):**
+- ✅ Observations with valid open licenses (CC-BY, CC0, CC-BY-NC, etc.)
+- ✅ Evidence type is "Organism" (actual animal sighting)
+- ✅ Evidence type is not specified
+
+**Auto-deselected (unchecked by default):**
+- ❌ Observations without licenses (copyright applies)
+- ❌ Observations with non-organism evidence types:
+  - Track/Footprint
+  - Scat/Feces
+  - Molt/Exuvia
+  - Feather
+  - Bone
+  - Gall
+  - Other indirect evidence
+
+**Auto-sorting:**
+- Valid observations (checked) appear at the **top** of the table
+- Excluded observations (unchecked) appear at the **bottom** of the table
+- You can still manually select/deselect any observation as needed
+
+**License display:**
+- License information is prominently displayed in a dedicated column
+- Shows all unique licenses for multi-photo observations
+- "No license" displayed when copyright applies
+
 ### CSV Format
 
 The CSV file contains the following columns:
@@ -239,10 +303,11 @@ The CSV file contains the following columns:
 | Encounter.locationID | Custom location ID (set via --use-locationID) |
 | Encounter.livingStatus | Living status of organism ("alive", "dead", or empty) |
 | Encounter.submitterID | Custom submitter ID (set via --use-submitterID) |
+| Sighting.sightingID | UUID linking related encounters from same observation (only populated when --social-split-observations is used) |
 | observer | iNaturalist username of observer |
 | quality_grade | Quality grade (research, needs_id, casual) |
 | url | Link to observation on iNaturalist |
-| Encounter.researcherComments | Download metadata including date and source URL |
+| Encounter.researcherComments | Download metadata including date, source URL, and license information (with HTML line breaks) |
 | photo_count | Number of photos for this observation |
 | photo_filenames | Semicolon-separated list of photo filenames |
 | Encounter.mediaAsset0 | Filename of first photo (if present) |
