@@ -360,6 +360,10 @@ class iNaturalistDownloader:
                             elif controlled_value_id is not None:
                                 has_non_organism_evidence = True
 
+            # Check if observation is part of "Skulls and Bones" project (ID 488)
+            project_ids = obs.get('project_ids', [])
+            is_skulls_and_bones = 488 in project_ids if project_ids else False
+
             # Download photos
             photos = obs.get('photos', [])
             photo_filenames = []
@@ -433,7 +437,8 @@ class iNaturalistDownloader:
                         'photo_filenames': photo_filename,
                         '_photo_list': [photo_filename],  # Single photo for this encounter
                         '_license_list': [photo_license],  # Single license for this encounter
-                        '_has_non_organism_evidence': has_non_organism_evidence  # For HTML deselection
+                        '_has_non_organism_evidence': has_non_organism_evidence,  # For HTML deselection
+                        '_is_skulls_and_bones': is_skulls_and_bones  # For HTML deselection
                     }
                     processed_data.append(row)
             else:
@@ -467,7 +472,8 @@ class iNaturalistDownloader:
                     'photo_filenames': '; '.join(photo_filenames),
                     '_photo_list': photo_filenames,  # Temporary field for photo processing
                     '_license_list': photo_licenses,  # Temporary field for license processing
-                    '_has_non_organism_evidence': has_non_organism_evidence  # For HTML deselection
+                    '_has_non_organism_evidence': has_non_organism_evidence,  # For HTML deselection
+                    '_is_skulls_and_bones': is_skulls_and_bones  # For HTML deselection
                 }
                 processed_data.append(row)
 
@@ -623,6 +629,7 @@ class iNaturalistDownloader:
                 'photo_filenames': '; '.join(photo_list),
                 'license_display': license_display,
                 'has_non_organism_evidence': row.get('_has_non_organism_evidence', False),
+                'is_skulls_and_bones': row.get('_is_skulls_and_bones', False),
                 'photo_path': photo_path,
                 'all_photo_paths': all_photo_paths,
                 'photos': [],
@@ -1117,9 +1124,11 @@ class iNaturalistDownloader:
                 .sort((a, b) => {{
                     const aChecked = a.obs.license_display !== 'No license' &&
                                      !a.obs.has_non_organism_evidence &&
+                                     !a.obs.is_skulls_and_bones &&
                                      a.obs.quality_grade !== 'needs_id';
                     const bChecked = b.obs.license_display !== 'No license' &&
                                      !b.obs.has_non_organism_evidence &&
+                                     !b.obs.is_skulls_and_bones &&
                                      b.obs.quality_grade !== 'needs_id';
 
                     // Checked items (true) should come first
@@ -1138,9 +1147,11 @@ class iNaturalistDownloader:
                 // Default to checked only if:
                 // 1. Observation has a license, AND
                 // 2. Evidence is NOT non-organism (track, scat, molt, etc.), AND
-                // 3. Quality grade is NOT "needs_id"
+                // 3. Observation is NOT part of "Skulls and Bones" project, AND
+                // 4. Quality grade is NOT "needs_id"
                 checkbox.checked = obs.license_display !== 'No license' &&
                                    !obs.has_non_organism_evidence &&
+                                   !obs.is_skulls_and_bones &&
                                    obs.quality_grade !== 'needs_id';
                 checkbox.id = `obs-${{index}}`;
                 checkbox.addEventListener('change', handleCheckboxChange);

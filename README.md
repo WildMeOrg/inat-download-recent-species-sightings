@@ -14,6 +14,7 @@ A Python utility for downloading recent observations of specific species from iN
 - **Smart filtering for HTML mode:**
   - Auto-deselects observations without licenses (copyright protected)
   - Auto-deselects "needs_id" quality grade (unconfirmed identifications)
+  - Auto-deselects "Skulls and Bones" project observations (specimens not useful for photo ID)
   - Auto-deselects non-organism evidence (tracks, scat, molt, etc.)
   - Auto-sorts with valid observations at the top
   - License information prominently displayed in table
@@ -265,6 +266,7 @@ The HTML review interface automatically applies intelligent filtering to help yo
 **Auto-deselected (unchecked by default):**
 - ❌ Observations without licenses (copyright applies)
 - ❌ Quality grade is "needs_id" (identification not yet confirmed)
+- ❌ Observations part of the "Skulls and Bones" project (ID 488) - skulls, skeletons, and bone specimens less useful for mark-recapture photo ID
 - ❌ Observations with non-organism evidence types:
   - Track/Footprint
   - Scat/Feces
