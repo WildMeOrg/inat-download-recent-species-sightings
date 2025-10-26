@@ -644,7 +644,7 @@ class iNaturalistDownloader:
             observations_json.append(obs_data)
 
         # Generate HTML content
-        html_content = self._generate_html_template(observations_json, max_photos)
+        html_content = self._generate_html_template(observations_json, max_photos, self.social_split)
 
         # Write HTML file
         with open(html_path, 'w', encoding='utf-8') as f:
@@ -655,7 +655,7 @@ class iNaturalistDownloader:
         print(f"Open this file in your web browser to review and select observations.")
         print(f"Maximum photos per observation: {max_photos}")
 
-    def _generate_html_template(self, observations: List[Dict], max_photos: int) -> str:
+    def _generate_html_template(self, observations: List[Dict], max_photos: int, social_split: bool) -> str:
         """Generate the HTML template with embedded JavaScript."""
         observations_json_str = json.dumps(observations, indent=2)
 
@@ -663,6 +663,7 @@ class iNaturalistDownloader:
         species_part = "_".join([s.replace(" ", "-") for s in self.species_list[:2]])
         place_part = f"_{self.place.replace(' ', '-')}" if self.place else ""
         date_part = datetime.now().strftime("%Y%m%d")
+        social_split_js = 'true' if social_split else 'false'
 
         return f'''<!DOCTYPE html>
 <html lang="en">
@@ -803,6 +804,29 @@ class iNaturalistDownloader:
             background: #d0d0d0;
         }}
 
+        .btn-merge {{
+            padding: 4px 12px;
+            font-size: 11px;
+            background: #2c7a3f;
+            color: white;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+
+        .btn-merge:hover {{
+            background: #235c31;
+        }}
+
+        .btn-merge.merged {{
+            background: #dc3545;
+        }}
+
+        .btn-merge.merged:hover {{
+            background: #c82333;
+        }}
+
         .table-wrapper {{
             width: 100%;
             overflow-x: auto;
@@ -835,6 +859,26 @@ class iNaturalistDownloader:
 
         .observations-table tbody tr:hover {{
             background: #f9f9f9;
+        }}
+
+        /* Alternating row colors for split observations */
+        .obs-group-even {{
+            background: #ffffff;
+        }}
+
+        .obs-group-odd {{
+            background: #f0f4ff;  /* Light blue background */
+        }}
+
+        .obs-group-even:hover,
+        .obs-group-odd:hover {{
+            background: #fff9e6 !important;  /* Light yellow on hover */
+        }}
+
+        /* Merged state styling */
+        .merged-row {{
+            border-left: 4px solid;  /* Border color set dynamically via JavaScript */
+            background: #fff0e6 !important;  /* Light orange background */
         }}
 
         .obs-checkbox {{
@@ -1067,6 +1111,7 @@ class iNaturalistDownloader:
                             <th>Quality</th>
                             <th>License</th>
                             <th>Photos</th>
+                            <th id="merge-header" style="display: none;">Merge</th>
                         </tr>
                     </thead>
                     <tbody id="observations-body">
@@ -1104,16 +1149,77 @@ class iNaturalistDownloader:
         // Observation data
         const observations = {observations_json_str};
         const maxPhotos = {max_photos};
+        const socialSplitMode = {social_split_js};
 
         // Filename components for CSV export
         const csvFilename = 'inat_observations_export_{species_part}{place_part}_{date_part}.csv';
 
+        // Track which sighting_ids have been merged (sighting_id -> boolean)
+        const mergedSightings = new Map();
+
+        // Track border colors for merged sighting groups (sighting_id -> color)
+        const mergedBorderColors = new Map();
+
+        // Palette of distinct colors for merged groups
+        const mergeColors = [
+            '#ff6b35',  // Orange
+            '#d62828',  // Red
+            '#9b59b6',  // Purple
+            '#3498db',  // Blue
+            '#2ecc71',  // Green
+            '#e67e22',  // Dark orange
+            '#e91e63',  // Pink
+            '#00bcd4',  // Cyan
+            '#ff9800',  // Amber
+            '#795548',  // Brown
+            '#607d8b',  // Blue grey
+            '#f39c12'   // Yellow-orange
+        ];
+
+        // Count how many rows share each sighting_id
+        const sightingIdCounts = new Map();
+        observations.forEach(obs => {{
+            if (obs.sighting_id) {{
+                const count = sightingIdCounts.get(obs.sighting_id) || 0;
+                sightingIdCounts.set(obs.sighting_id, count + 1);
+            }}
+        }});
+
         // Initialize
         document.addEventListener('DOMContentLoaded', function() {{
+            if (socialSplitMode) {{
+                initializeMergeColumn();
+            }}
             renderObservations();
             updateCSV();
             updateStats();
         }});
+
+        function initializeMergeColumn() {{
+            // Show the merge column header
+            const mergeHeader = document.getElementById('merge-header');
+            if (mergeHeader) {{
+                mergeHeader.style.display = '';
+            }}
+        }}
+
+        function toggleMerge(sightingId) {{
+            if (!sightingId) return;
+
+            // Toggle merge state
+            const currentState = mergedSightings.get(sightingId) || false;
+            mergedSightings.set(sightingId, !currentState);
+
+            // Assign a random color when merging (if not already assigned)
+            if (!currentState && !mergedBorderColors.has(sightingId)) {{
+                const randomColor = mergeColors[Math.floor(Math.random() * mergeColors.length)];
+                mergedBorderColors.set(sightingId, randomColor);
+            }}
+
+            // Re-render to show updated state
+            renderObservations();
+            updateCSV();
+        }}
 
         function renderObservations() {{
             const tbody = document.getElementById('observations-body');
@@ -1136,8 +1242,33 @@ class iNaturalistDownloader:
                     return aChecked ? -1 : 1;
                 }});
 
+            // Track observation IDs for alternating colors
+            const observationIdMap = new Map();
+            let colorIndex = 0;
+
             sortedObservations.forEach(({{obs, index}}) => {{
                 const tr = document.createElement('tr');
+
+                // Apply alternating row colors for social split mode
+                if (socialSplitMode && obs.sighting_id) {{
+                    // Assign color group based on observation_id
+                    if (!observationIdMap.has(obs.observation_id)) {{
+                        observationIdMap.set(obs.observation_id, colorIndex % 2);
+                        colorIndex++;
+                    }}
+                    const groupClass = observationIdMap.get(obs.observation_id) === 0 ? 'obs-group-even' : 'obs-group-odd';
+                    tr.classList.add(groupClass);
+
+                    // Check if this sighting is merged
+                    if (mergedSightings.get(obs.sighting_id)) {{
+                        tr.classList.add('merged-row');
+                        // Apply the assigned border color
+                        const borderColor = mergedBorderColors.get(obs.sighting_id);
+                        if (borderColor) {{
+                            tr.style.borderLeftColor = borderColor;
+                        }}
+                    }}
+                }}
 
                 // Checkbox
                 const tdCheckbox = document.createElement('td');
@@ -1246,6 +1377,22 @@ class iNaturalistDownloader:
                 tdPhotoCount.textContent = obs.photo_count;
                 tr.appendChild(tdPhotoCount);
 
+                // Merge button (only in social split mode and only if sighting_id has multiple rows)
+                if (socialSplitMode) {{
+                    const tdMerge = document.createElement('td');
+                    // Only show merge button if this sighting_id appears in multiple rows
+                    const rowCount = sightingIdCounts.get(obs.sighting_id) || 0;
+                    if (obs.sighting_id && rowCount > 1) {{
+                        const isMerged = mergedSightings.get(obs.sighting_id) || false;
+                        const mergeBtn = document.createElement('button');
+                        mergeBtn.className = 'btn-merge' + (isMerged ? ' merged' : '');
+                        mergeBtn.textContent = isMerged ? 'Unmerge' : 'Merge';
+                        mergeBtn.onclick = () => toggleMerge(obs.sighting_id);
+                        tdMerge.appendChild(mergeBtn);
+                    }}
+                    tr.appendChild(tdMerge);
+                }}
+
                 tbody.appendChild(tr);
             }});
         }}
@@ -1303,6 +1450,61 @@ class iNaturalistDownloader:
                 return 'No observations selected';
             }}
 
+            // Process data: merge rows if their sighting_id is marked as merged
+            let processedData = [];
+
+            if (socialSplitMode) {{
+                // Group observations by sighting_id
+                const sightingGroups = new Map();
+
+                data.forEach(obs => {{
+                    const sightingId = obs.sighting_id;
+
+                    // If this sighting is merged, group all rows together
+                    if (sightingId && mergedSightings.get(sightingId)) {{
+                        if (!sightingGroups.has(sightingId)) {{
+                            sightingGroups.set(sightingId, []);
+                        }}
+                        sightingGroups.get(sightingId).push(obs);
+                    }} else {{
+                        // Not merged, add as individual row
+                        processedData.push(obs);
+                    }}
+                }});
+
+                // Merge grouped observations into single rows
+                sightingGroups.forEach((obsGroup, sightingId) => {{
+                    if (obsGroup.length === 0) return;
+
+                    // Use first observation as base
+                    const mergedObs = {{ ...obsGroup[0] }};
+
+                    // Collect all photos and licenses from all observations in the group
+                    const allPhotos = [];
+                    const allLicenses = [];
+
+                    obsGroup.forEach(obs => {{
+                        obs.photos.forEach((photo, idx) => {{
+                            if (photo) {{
+                                allPhotos.push(photo);
+                                allLicenses.push(obs.licenses[idx] || '');
+                            }}
+                        }});
+                    }});
+
+                    // Update merged observation with combined photos
+                    mergedObs.photos = allPhotos;
+                    mergedObs.licenses = allLicenses;
+                    mergedObs.photo_count = allPhotos.length;
+                    mergedObs.photo_filenames = allPhotos.join('; ');
+
+                    processedData.push(mergedObs);
+                }});
+            }} else {{
+                // Not in social split mode, use data as-is
+                processedData = data;
+            }}
+
             // Build header
             const headers = [
                 'observation_id',
@@ -1339,7 +1541,7 @@ class iNaturalistDownloader:
             const rows = [headers.join(',')];
 
             // Add data rows
-            data.forEach(obs => {{
+            processedData.forEach(obs => {{
                 const row = [
                     escapeCSV(obs.observation_id),
                     escapeCSV(obs.observed_on),

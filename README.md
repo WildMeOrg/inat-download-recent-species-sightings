@@ -199,11 +199,12 @@ python3 inat-download-new-species-sightings.py \
 For highly social species where multiple individuals may appear in the same observation, use `--social-split-observations` to create one Encounter per photo:
 
 ```bash
-# Split multi-photo observations into separate encounters
+# Split multi-photo observations into separate encounters (use with --html-review for merge control)
 python3 inat-download-new-species-sightings.py \
   --species "weedy seadragon" \
   --days 30 \
   --social-split-observations \
+  --html-review \
   --output ./data
 ```
 
@@ -217,6 +218,14 @@ python3 inat-download-new-species-sightings.py \
 **Example result:**
 - Original: 1 observation with 4 photos → 4 CSV rows (each with 1 photo, same Sighting.sightingID)
 - "Single subject" observation with 3 photos → 1 CSV row (all 3 photos together)
+
+**HTML Review Mode Features (when using --social-split-observations):**
+- **Alternating row colors**: Rows from the same original observation are color-coded (alternating light green and white backgrounds) to help you identify which rows belong together
+- **Merge button**: Each split observation has a "Merge" button. Click it to re-combine all photos from that observation back into a single row
+  - Merged rows are highlighted with a green border and background
+  - The "Merge" button becomes "Unmerge" - click again to undo the merge
+  - Merged rows appear as a single row in the exported CSV with all photos combined
+  - Unmerged rows remain as separate CSV rows (one per photo)
 
 ## Output Structure
 
