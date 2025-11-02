@@ -186,6 +186,7 @@ class iNaturalistDownloader:
                 'd2': end_date,
                 'has[]': 'photos',
                 'quality_grade': 'any',
+                'captive': 'false',  # Only wild organisms, exclude captive/cultivated
                 'per_page': per_page,
                 'page': page,
                 'order_by': 'observed_on'

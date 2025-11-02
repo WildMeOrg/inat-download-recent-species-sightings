@@ -5,6 +5,7 @@ A Python utility for downloading recent observations of specific species from iN
 ## Features
 
 - Downloads observations from iNaturalist for specified species
+- **Automatically excludes captive/cultivated organisms** - only wild observations are downloaded
 - Configurable time range (number of days back)
 - Geographic filtering by place (country, state, county, etc.)
 - Downloads all photos associated with each observation
