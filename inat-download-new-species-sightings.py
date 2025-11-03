@@ -26,7 +26,7 @@ class iNaturalistDownloader:
 
     BASE_URL = "https://api.inaturalist.org/v1"
 
-    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None, social_split: bool = False):
+    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None, social_split: bool = False, clip_filter: str = None):
         """
         Initialize the downloader.
 
@@ -40,6 +40,7 @@ class iNaturalistDownloader:
             location_id: Optional location ID to add to all observations in Encounter.locationID column
             submitter_id: Optional submitter ID to add to all observations in Encounter.submitterID column
             social_split: Split multi-photo observations into separate rows with shared sighting ID (default: False)
+            clip_filter: Optional CLIP text prompts to filter out images (comma-separated, e.g., "footprint,track,paw print")
         """
         self.output_dir = Path(output_dir)
         self.days_back = days_back
@@ -51,7 +52,12 @@ class iNaturalistDownloader:
         self.location_id = location_id
         self.submitter_id = submitter_id
         self.social_split = social_split
+        self.clip_filter = clip_filter
         self.photos_dir = self.output_dir / "photos"
+
+        # CLIP model (lazy-loaded when needed)
+        self.clip_model = None
+        self.clip_processor = None
 
         # Create directories if they don't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -229,6 +235,88 @@ class iNaturalistDownloader:
         print(f"  Total observations found: {len(all_observations)}")
         return all_observations
 
+    def load_clip_model(self):
+        """Load CLIP model for image analysis (lazy loading)."""
+        if self.clip_model is not None:
+            return  # Already loaded
+
+        try:
+            from PIL import Image
+            import torch
+            from transformers import CLIPProcessor, CLIPModel
+
+            print("Loading CLIP model for image analysis...")
+            self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+            self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            print("  CLIP model loaded successfully")
+        except ImportError:
+            print("\nError: CLIP filtering requires additional packages.")
+            print("Please install them with: pip install transformers torch pillow")
+            sys.exit(1)
+        except Exception as e:
+            print(f"\nError loading CLIP model: {e}")
+            sys.exit(1)
+
+    def analyze_image_with_clip(self, image_path: str, filter_terms: List[str]) -> bool:
+        """
+        Analyze an image using CLIP to determine if it matches any filter terms.
+
+        Args:
+            image_path: Path to the image file
+            filter_terms: List of text descriptions to check against (e.g., ["footprint", "track"])
+
+        Returns:
+            True if image matches any filter term (should be filtered out), False otherwise
+        """
+        if not self.clip_model:
+            self.load_clip_model()
+
+        try:
+            from PIL import Image
+            import torch
+
+            # Load and process image
+            image = Image.open(image_path).convert('RGB')
+
+            # Create text prompts - add positive prompt for the actual organism
+            negative_prompts = filter_terms  # e.g., ["footprint", "track", "paw print"]
+            positive_prompt = ["a photograph of a live animal", "a photograph of a living organism"]
+            all_prompts = positive_prompt + negative_prompts
+
+            # Process inputs
+            inputs = self.clip_processor(
+                text=all_prompts,
+                images=image,
+                return_tensors="pt",
+                padding=True
+            )
+
+            # Get predictions
+            with torch.no_grad():
+                outputs = self.clip_model(**inputs)
+                logits_per_image = outputs.logits_per_image
+                probs = logits_per_image.softmax(dim=1)[0]
+
+            # Check if any negative prompt has high probability
+            # We use indices 2+ for negative prompts (first 2 are positive)
+            negative_probs = probs[len(positive_prompt):]
+            max_negative_prob = negative_probs.max().item()
+
+            # If any filter term has >40% probability, mark for filtering
+            # Adjust threshold as needed (higher = more strict)
+            threshold = 0.40
+
+            if max_negative_prob > threshold:
+                max_idx = negative_probs.argmax().item()
+                matched_term = filter_terms[max_idx]
+                return True, matched_term, max_negative_prob
+
+            return False, None, 0.0
+
+        except Exception as e:
+            print(f"      Warning: Error analyzing image {image_path} with CLIP: {e}")
+            return False, None, 0.0
+
     def download_photo(self, url: str, filename: str) -> bool:
         """
         Download a photo from URL to the photos directory.
@@ -252,6 +340,76 @@ class iNaturalistDownloader:
         except Exception as e:
             print(f"      Error downloading photo {filename}: {e}")
             return False
+
+    def extract_gif_frames(self, gif_path: Path) -> List[str]:
+        """
+        Extract all frames from an animated GIF and save as JPEGs.
+
+        Args:
+            gif_path: Path to the GIF file
+
+        Returns:
+            List of JPEG filenames that were created (without directory path)
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            print("      Warning: PIL/Pillow not installed. Cannot convert animated GIFs.")
+            print("      Install with: pip3 install Pillow")
+            return []
+
+        try:
+            img = Image.open(gif_path)
+
+            # Check if it's animated (has multiple frames)
+            frame_count = getattr(img, 'n_frames', 1)
+
+            if frame_count <= 1:
+                # Not animated, no need to extract frames
+                img.close()
+                return []
+
+            print(f"      Detected animated GIF with {frame_count} frames, extracting...")
+
+            # Base filename (without extension)
+            base_name = gif_path.stem  # e.g., "12345_1"
+
+            extracted_filenames = []
+
+            # Extract each frame
+            for frame_idx in range(frame_count):
+                img.seek(frame_idx)
+
+                # Convert to RGB (GIFs can be in palette mode or have transparency)
+                rgb_frame = img.convert('RGB')
+
+                # Create filename for this frame: 12345_1_frame0.jpg, 12345_1_frame1.jpg, etc.
+                frame_filename = f"{base_name}_frame{frame_idx}.jpg"
+                frame_path = self.photos_dir / frame_filename
+
+                # Save as JPEG with high quality
+                rgb_frame.save(frame_path, 'JPEG', quality=90)
+                extracted_filenames.append(frame_filename)
+
+            print(f"      Extracted {len(extracted_filenames)} frames from GIF")
+
+            # Close the image before deleting (important on Windows to release file lock)
+            img.close()
+
+            # Delete the original GIF after successful extraction
+            gif_path.unlink()
+            print(f"      Deleted original GIF: {gif_path.name}")
+
+            return extracted_filenames
+
+        except Exception as e:
+            print(f"      Error extracting frames from GIF {gif_path.name}: {e}")
+            # Make sure to close the image if there was an error
+            try:
+                img.close()
+            except:
+                pass
+            return []
 
     def process_observations(self, observations: List[Dict[Any, Any]], species_name: str) -> List[Dict[str, Any]]:
         """
@@ -388,8 +546,23 @@ class iNaturalistDownloader:
                     photo_filename = f"{obs_id}_{photo_idx}.{photo_ext}"
 
                     if self.download_photo(photo_url, photo_filename):
-                        photo_filenames.append(photo_filename)
-                        photo_licenses.append(license_code)
+                        # Check if the downloaded file is a GIF and extract frames if animated
+                        photo_path = self.photos_dir / photo_filename
+                        if photo_path.suffix.lower() == '.gif':
+                            extracted_frames = self.extract_gif_frames(photo_path)
+                            if extracted_frames:
+                                # Add all extracted frames to the list (GIF was deleted)
+                                for frame_filename in extracted_frames:
+                                    photo_filenames.append(frame_filename)
+                                    photo_licenses.append(license_code)
+                            else:
+                                # Not animated or extraction failed, keep original
+                                photo_filenames.append(photo_filename)
+                                photo_licenses.append(license_code)
+                        else:
+                            # Not a GIF, add normally
+                            photo_filenames.append(photo_filename)
+                            photo_licenses.append(license_code)
 
             # Create researcher comments with download date, source URL, and license info
             today_date = datetime.now().strftime("%Y-%m-%d")
