@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "inat-wildbook": {
+      "type": "stdio",
+      "command": "/mnt/c/inat-download-recent-species-sightings/inat-mcp-server/venv/bin/python",
+      "args": ["/mnt/c/inat-download-recent-species-sightings/inat-mcp-server/server.py"]
+    }
+  }
+}
