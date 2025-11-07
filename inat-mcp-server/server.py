@@ -33,6 +33,9 @@ inat_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(inat_module)
 iNaturalistDownloader = inat_module.iNaturalistDownloader
 
+# Import YouTube tools
+from youtube_tools import YouTubeSearcher, format_video_results
+
 # Create MCP server instance
 server = Server("inat-wildbook-integration")
 
@@ -152,6 +155,108 @@ Returns: List of matching places with IDs, types (country/state/county), and dis
                 },
                 "required": ["place_query"]
             }
+        ),
+        types.Tool(
+            name="search_youtube_videos",
+            description="""Search YouTube for recent wildlife videos by species name.
+
+Searches YouTube for videos about any species (uses scientific or common names).
+Works with any species - mammals, birds, fish, reptiles, invertebrates, plants, etc.
+
+Features:
+- Search by scientific name (e.g., "Panthera leo") or common name (e.g., "lion")
+- Filter by upload date (last N days)
+- Optional keyword filtering (include/exclude specific terms)
+- Returns video metadata: title, description, channel, URL, thumbnail
+
+Requires: YOUTUBE_API_KEY environment variable set.
+
+Returns: List of matching videos with metadata.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "species": {
+                        "type": "string",
+                        "description": "Species name (scientific or common). Examples: 'Rhincodon typus', 'whale shark', 'Panthera onca', 'jaguar'"
+                    },
+                    "days_back": {
+                        "type": "integer",
+                        "description": "Number of days back to search (default: 1)",
+                        "default": 1
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of videos to return (default: 25, max: 50)",
+                        "default": 25
+                    },
+                    "additional_keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional keywords to include (e.g., ['wild', 'safari', 'encounter'])"
+                    },
+                    "exclude_keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional keywords to exclude (e.g., ['cartoon', 'toy', 'game', 'drawing'])"
+                    }
+                },
+                "required": ["species"]
+            }
+        ),
+        types.Tool(
+            name="search_youtube_multilanguage",
+            description="""Search YouTube for wildlife videos using multiple language variants of a species name.
+
+Searches YouTube with common names in different languages to find more videos.
+Automatically deduplicates results. Works with any species.
+
+Features:
+- Multi-language search (provide species names in different languages)
+- Automatic deduplication by video ID
+- Returns which language matched each video
+- Optional keyword filtering
+
+Requires: YOUTUBE_API_KEY environment variable set.
+
+Example usage:
+  species_names: {
+    "en": "whale shark",
+    "es": "tiburón ballena",
+    "fr": "requin-baleine",
+    "scientific": "Rhincodon typus"
+  }
+
+Returns: Deduplicated list of videos across all languages.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "species_names": {
+                        "type": "object",
+                        "description": "Dictionary of language code to species name. Keys can be language codes (en, es, fr, de, zh) or 'scientific'. Example: {'en': 'lion', 'es': 'león', 'scientific': 'Panthera leo'}"
+                    },
+                    "days_back": {
+                        "type": "integer",
+                        "description": "Number of days back to search (default: 1)",
+                        "default": 1
+                    },
+                    "max_results_per_language": {
+                        "type": "integer",
+                        "description": "Maximum results per language variant (default: 10)",
+                        "default": 10
+                    },
+                    "additional_keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional keywords to include in all searches"
+                    },
+                    "exclude_keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional keywords to exclude from all searches (e.g., ['cartoon', 'toy'])"
+                    }
+                },
+                "required": ["species_names"]
+            }
         )
     ]
 
@@ -167,6 +272,10 @@ async def handle_call_tool(
         return await get_species_summary_tool(arguments or {})
     elif name == "list_place_suggestions":
         return await list_places_tool(arguments or {})
+    elif name == "search_youtube_videos":
+        return await search_youtube_tool(arguments or {})
+    elif name == "search_youtube_multilanguage":
+        return await search_youtube_multilanguage_tool(arguments or {})
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -430,6 +539,159 @@ async def list_places_tool(args: dict[str, Any]) -> list[types.TextContent]:
     except Exception as e:
         import traceback
         error_msg = f"Error searching places: {str(e)}\n\n"
+        error_msg += "Traceback:\n" + traceback.format_exc()
+        return [types.TextContent(type="text", text=error_msg)]
+
+async def search_youtube_tool(args: dict[str, Any]) -> list[types.TextContent]:
+    """Search YouTube for wildlife videos."""
+
+    species = args.get("species")
+    days_back = args.get("days_back", 1)
+    max_results = args.get("max_results", 25)
+    additional_keywords = args.get("additional_keywords")
+    exclude_keywords = args.get("exclude_keywords")
+
+    if not species:
+        return [types.TextContent(
+            type="text",
+            text="Error: species parameter is required"
+        )]
+
+    try:
+        # Check for API key
+        api_key = os.environ.get('YOUTUBE_API_KEY')
+        if not api_key:
+            return [types.TextContent(
+                type="text",
+                text="Error: YOUTUBE_API_KEY environment variable not set.\n\n"
+                     "To use YouTube tools, you need a YouTube Data API v3 key:\n"
+                     "1. Go to https://console.cloud.google.com/apis/credentials\n"
+                     "2. Create a project (if needed)\n"
+                     "3. Enable YouTube Data API v3\n"
+                     "4. Create an API key\n"
+                     "5. Set environment variable: export YOUTUBE_API_KEY='your-key'"
+            )]
+
+        # Create searcher and search
+        searcher = YouTubeSearcher(api_key=api_key)
+
+        videos = searcher.search_videos(
+            species_query=species,
+            days_back=days_back,
+            max_results=max_results,
+            additional_keywords=additional_keywords,
+            exclude_keywords=exclude_keywords
+        )
+
+        if not videos:
+            result = f"**Species:** {species}\n"
+            result += f"**Time period:** Last {days_back} days\n"
+            result += f"\n**Result:** No videos found"
+            return [types.TextContent(type="text", text=result)]
+
+        # Format results
+        result = f"**YouTube Search Results**\n\n"
+        result += f"**Species:** {species}\n"
+        result += f"**Time period:** Last {days_back} days\n"
+        if additional_keywords:
+            result += f"**Additional keywords:** {', '.join(additional_keywords)}\n"
+        if exclude_keywords:
+            result += f"**Excluded keywords:** {', '.join(exclude_keywords)}\n"
+        result += f"\n"
+
+        result += format_video_results(videos, include_descriptions=True)
+
+        return [types.TextContent(type="text", text=result)]
+
+    except Exception as e:
+        import traceback
+        error_msg = f"Error searching YouTube: {str(e)}\n\n"
+        error_msg += "Traceback:\n" + traceback.format_exc()
+        return [types.TextContent(type="text", text=error_msg)]
+
+async def search_youtube_multilanguage_tool(args: dict[str, Any]) -> list[types.TextContent]:
+    """Search YouTube with multiple language variants."""
+
+    species_names = args.get("species_names")
+    days_back = args.get("days_back", 1)
+    max_results_per_language = args.get("max_results_per_language", 10)
+    additional_keywords = args.get("additional_keywords")
+    exclude_keywords = args.get("exclude_keywords")
+
+    if not species_names:
+        return [types.TextContent(
+            type="text",
+            text="Error: species_names parameter is required"
+        )]
+
+    if not isinstance(species_names, dict):
+        return [types.TextContent(
+            type="text",
+            text="Error: species_names must be a dictionary (e.g., {'en': 'whale shark', 'es': 'tiburón ballena'})"
+        )]
+
+    try:
+        # Check for API key
+        api_key = os.environ.get('YOUTUBE_API_KEY')
+        if not api_key:
+            return [types.TextContent(
+                type="text",
+                text="Error: YOUTUBE_API_KEY environment variable not set.\n\n"
+                     "To use YouTube tools, you need a YouTube Data API v3 key:\n"
+                     "1. Go to https://console.cloud.google.com/apis/credentials\n"
+                     "2. Create a project (if needed)\n"
+                     "3. Enable YouTube Data API v3\n"
+                     "4. Create an API key\n"
+                     "5. Set environment variable: export YOUTUBE_API_KEY='your-key'"
+            )]
+
+        # Create searcher and search
+        searcher = YouTubeSearcher(api_key=api_key)
+
+        videos = searcher.search_multi_language(
+            species_names=species_names,
+            days_back=days_back,
+            max_results_per_language=max_results_per_language,
+            additional_keywords=additional_keywords,
+            exclude_keywords=exclude_keywords
+        )
+
+        if not videos:
+            result = f"**Multi-Language YouTube Search**\n\n"
+            result += f"**Languages searched:** {', '.join(species_names.keys())}\n"
+            result += f"**Time period:** Last {days_back} days\n"
+            result += f"\n**Result:** No videos found"
+            return [types.TextContent(type="text", text=result)]
+
+        # Format results
+        result = f"**Multi-Language YouTube Search Results**\n\n"
+        result += f"**Species names searched:**\n"
+        for lang, name in species_names.items():
+            result += f"  - {lang}: {name}\n"
+        result += f"**Time period:** Last {days_back} days\n"
+        if additional_keywords:
+            result += f"**Additional keywords:** {', '.join(additional_keywords)}\n"
+        if exclude_keywords:
+            result += f"**Excluded keywords:** {', '.join(exclude_keywords)}\n"
+        result += f"\n"
+
+        result += format_video_results(videos, include_descriptions=True)
+
+        # Add language match statistics
+        language_counts = {}
+        for video in videos:
+            lang = video.get('matched_language', 'unknown')
+            language_counts[lang] = language_counts.get(lang, 0) + 1
+
+        result += f"\n**Videos by matched language:**\n"
+        for lang, count in sorted(language_counts.items(), key=lambda x: x[1], reverse=True):
+            result += f"- {lang}: {count}\n"
+
+        return [types.TextContent(type="text", text=result)]
+
+    except Exception as e:
+        import traceback
+        error_msg = f"Error searching YouTube (multi-language): {str(e)}\n\n"
         error_msg += "Traceback:\n" + traceback.format_exc()
         return [types.TextContent(type="text", text=error_msg)]
 

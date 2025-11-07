@@ -1,10 +1,12 @@
 # iNaturalist-Wildbook MCP Server
 
-An MCP (Model Context Protocol) server that enables AI assistants like Claude to download and process wildlife observations from iNaturalist for import into Wildbook mark-recapture databases.
+An MCP (Model Context Protocol) server that enables AI assistants like Claude to download and process wildlife observations from iNaturalist and YouTube for import into Wildbook mark-recapture databases.
 
 ## Features
 
-This MCP server provides AI agents with three powerful tools:
+This MCP server provides AI agents with five powerful tools:
+
+### iNaturalist Tools
 
 ### 1. `download_observations`
 Download wildlife observations from iNaturalist with intelligent filtering:
@@ -31,6 +33,25 @@ Search for place names on iNaturalist to help with geographic filtering:
 - Returns place types (country, state, county, etc.)
 - Provides exact names for filtering
 
+### YouTube Tools
+
+### 4. `search_youtube_videos`
+Search YouTube for recent wildlife videos by species name:
+- Works with ANY species (mammals, birds, fish, reptiles, plants, etc.)
+- Search by scientific or common names
+- Filter by upload date (last N days)
+- Optional keyword filtering (include/exclude terms)
+- Returns video metadata: title, description, channel, URLs, thumbnails
+- **Requires:** YOUTUBE_API_KEY environment variable
+
+### 5. `search_youtube_multilanguage`
+Search YouTube using multiple language variants of a species name:
+- Multi-language search (English, Spanish, French, German, Chinese, etc.)
+- Automatic deduplication by video ID
+- Shows which language matched each video
+- Optional keyword filtering
+- **Requires:** YOUTUBE_API_KEY environment variable
+
 ## Installation
 
 ### Prerequisites
@@ -55,6 +76,27 @@ pip install Pillow
 ```bash
 chmod +x inat-mcp-server/server.py
 ```
+
+### Step 4: Get YouTube API Key (Optional - for YouTube tools)
+
+To use the YouTube search tools, you need a free YouTube Data API v3 key:
+
+1. Go to https://console.cloud.google.com/apis/credentials
+2. Create a new project (or select existing)
+3. Enable "YouTube Data API v3"
+4. Create credentials → API key
+5. Set the environment variable:
+
+```bash
+export YOUTUBE_API_KEY="your-api-key-here"
+```
+
+Or add to your shell profile (`~/.bashrc`, `~/.zshrc`):
+```bash
+echo 'export YOUTUBE_API_KEY="your-api-key-here"' >> ~/.bashrc
+```
+
+**Note:** The YouTube API has a free quota of 10,000 units/day (enough for ~100 searches).
 
 ## Configuration
 
@@ -155,6 +197,40 @@ Claude will intelligently:
 2. Download from both states
 3. Use location_id parameter
 4. Generate HTML review for manual curation
+
+### Example 6: Search YouTube for wildlife videos
+
+```
+Find whale shark videos uploaded to YouTube in the last week
+```
+
+Claude will use `search_youtube_videos` with:
+- species: "Rhincodon typus" or "whale shark"
+- days_back: 7
+- Returns: Video titles, channels, URLs, descriptions
+
+### Example 7: Multi-language YouTube search
+
+```
+Search for jaguar videos in English, Spanish, and Portuguese from the last 24 hours
+```
+
+Claude will use `search_youtube_multilanguage` with:
+- species_names: {"en": "jaguar", "es": "jaguar", "pt": "onça-pintada", "scientific": "Panthera onca"}
+- days_back: 1
+- Automatically deduplicates results across languages
+
+### Example 8: Combined iNaturalist + YouTube search
+
+```
+Find all recent whale shark sightings from this week - check both iNaturalist and YouTube
+```
+
+Claude will:
+1. Use `get_recent_species_summary` for iNaturalist observations
+2. Use `search_youtube_videos` for recent YouTube videos
+3. Combine results into a unified report
+4. Show both citizen science observations AND tourist/diver videos
 
 ## Tool Details
 
