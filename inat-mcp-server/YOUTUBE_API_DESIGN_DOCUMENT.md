@@ -404,35 +404,12 @@ except APIError as e:
 
 ## 10. Project Governance
 
-### 10.1 Open Source
-
-**Transparency:**
-- Code: MIT License (GitHub)
-- Design docs: Publicly available
-- API usage: Logged and auditable
-- No proprietary components
-
-**Repository:** https://github.com/[organization]/inat-wildbook-mcp
-
-### 10.2 Team
 
 **Maintainers:**
-- Wildlife research software engineers
+- Wildlife research software engineers @ Conservation X Labs
 - Conservation biologists
 - Citizen science coordinators
 
-**Oversight:**
-- University research ethics boards
-- Conservation organization partnerships
-- Open-source community contributors
-
-### 10.3 Sustainability
-
-**Funding Model:**
-- Grant-funded research projects
-- University partnerships
-- Conservation NGO support
-- No commercial revenue
 
 ---
 
@@ -478,14 +455,11 @@ This YouTube API integration enables wildlife researchers worldwide to discover 
 
 ### 12.2 Quota Justification
 
-**Current Limit (10,000 units/day):**
-- Supports 1-2 research projects
-- ~100 searches/day
-- English-only
+**Current Limit (0 units/day):**
 - No automation possible
 
 **Requested Quota (100,000 units/day):**
-- Supports 5-10 research groups
+- Supports 1 account
 - ~1,000 searches/day
 - Multi-language (5+ languages)
 - Enables automated daily monitoring
@@ -501,18 +475,7 @@ Increasing our YouTube API quota directly translates to:
 
 We respectfully request a quota increase to 100,000 units/day to support our mission of leveraging citizen science video data for wildlife conservation research.
 
----
 
-## 13. Contact Information
-
-**Project Name:** iNaturalist-Wildbook MCP Server
-**Organization:** [Your Organization/University]
-**Primary Contact:** [Your Name]
-**Email:** [Your Email]
-**Website:** [Project URL]
-**GitHub:** https://github.com/[organization]/inat-wildbook-mcp
-
----
 
 ## Appendices
 
@@ -539,29 +502,3 @@ for language, term in species_terms.items():
     )
 ```
 
-### Appendix B: Species List (Sample)
-
-**Marine:**
-- Whale shark (Rhincodon typus)
-- Manta ray (Mobula birostris)
-- Sea turtle species (Cheloniidae family)
-- Bottlenose dolphin (Tursiops truncatus)
-
-**Terrestrial:**
-- Jaguar (Panthera onca)
-- African lion (Panthera leo)
-- Mountain gorilla (Gorilla beringei)
-- Snow leopard (Panthera uncia)
-
-### Appendix C: Research Partners
-
-- [University Marine Biology Departments]
-- [Conservation NGOs using Wildbook]
-- [Citizen Science Platforms]
-- [Mark-Recapture Research Groups]
-
----
-
-**Document Version:** 1.0
-**Last Updated:** November 2024
-**Next Review:** Quarterly
