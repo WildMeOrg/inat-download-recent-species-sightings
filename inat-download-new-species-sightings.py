@@ -1969,6 +1969,22 @@ class iNaturalistDownloader:
             processed_data = self.process_observations(observations, species_name)
             all_observations_data.extend(processed_data)
 
+        # Deduplicate observations by observation_id
+        # (Multiple species names may resolve to the same taxon, causing duplicates)
+        if all_observations_data:
+            print(f"\nDeduplicating observations...")
+            print(f"  Total observations before deduplication: {len(all_observations_data)}")
+
+            # Use a dict to deduplicate by observation_id, keeping first occurrence
+            unique_obs = {}
+            for obs in all_observations_data:
+                obs_id = obs.get('observation_id')
+                if obs_id not in unique_obs:
+                    unique_obs[obs_id] = obs
+
+            all_observations_data = list(unique_obs.values())
+            print(f"  Unique observations after deduplication: {len(all_observations_data)}")
+
         # Write to CSV or HTML
         if all_observations_data:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
