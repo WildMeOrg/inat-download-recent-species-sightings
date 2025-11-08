@@ -512,8 +512,11 @@ class FlickrDownloader:
 
         # Build observations for JSON
         observations_json = []
+        max_photos = 1  # Flickr only has 1 photo per observation
+
         for row in data:
             photo_list = row.get('_photo_list', [])
+            license_list = row.get('_license_list', [])
 
             # Use file path for photo preview
             photo_path = None
@@ -552,6 +555,8 @@ class FlickrDownloader:
                 'license_display': row.get('license', 'Unknown'),
                 'photo_path': photo_path,
                 'all_photo_paths': all_photo_paths,
+                '_photo_list': photo_list,  # Keep for CSV export
+                '_license_list': license_list,  # Keep for CSV export
             }
 
             observations_json.append(obs_data)
@@ -970,10 +975,17 @@ class FlickrDownloader:
             csv += 'scientific_name,Encounter.genus,Encounter.specificEpithet,common_name,';
             csv += 'Encounter.decimalLatitude,Encounter.decimalLongitude,Encounter.verbatimLocality,';
             csv += 'Encounter.locationID,Encounter.livingStatus,Encounter.submitterID,';
-            csv += 'Sighting.sightingID,Encounter.sightingRemarks,observer,quality_grade,url,Encounter.researcherComments\\n';
+            csv += 'Sighting.sightingID,Encounter.sightingRemarks,observer,quality_grade,url,Encounter.researcherComments,';
+            csv += 'Encounter.mediaAsset0,Encounter.mediaAsset0.license\\n';
 
             selected.forEach(obs => {{
                 const escape = (str) => `"${{(str || '').toString().replace(/"/g, '""')}}"`;
+
+                // Get photo filename and license from photo list
+                const photoList = obs._photo_list || [];
+                const licenseList = obs._license_list || [];
+                const photo0 = photoList.length > 0 ? photoList[0] : '';
+                const license0 = licenseList.length > 0 ? licenseList[0] : '';
 
                 const row = [
                     escape(obs.observation_id),
@@ -996,7 +1008,9 @@ class FlickrDownloader:
                     escape(obs.observer),
                     escape(obs.quality_grade),
                     escape(obs.url),
-                    escape(obs.researcher_comments)
+                    escape(obs.researcher_comments),
+                    escape(photo0),
+                    escape(license0)
                 ];
 
                 csv += row.join(',') + '\\n';
