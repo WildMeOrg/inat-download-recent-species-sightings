@@ -36,6 +36,9 @@ iNaturalistDownloader = inat_module.iNaturalistDownloader
 # Import YouTube tools
 from youtube_tools import YouTubeSearcher, format_video_results, generate_html_report
 
+# Import Flickr tools
+from flickr_tools import FlickrDownloader
+
 # Create MCP server instance
 server = Server("inat-wildbook-integration")
 
@@ -257,6 +260,70 @@ Returns: Deduplicated list of videos across all languages.""",
                 },
                 "required": ["species_names"]
             }
+        ),
+        types.Tool(
+            name="download_flickr_observations",
+            description="""Download Creative Commons licensed wildlife photos from Flickr with GPS coordinates.
+
+Searches Flickr for geo-tagged wildlife photos with acceptable CC licenses and downloads them
+for Wildbook integration. Generates HTML review page matching iNaturalist workflow.
+
+Key features:
+- CC license filtering (CC BY, CC BY-SA, CC0, Public Domain)
+- GPS coordinate extraction
+- Date filtering (days back from today)
+- Generates HTML review page for manual curation
+- Wildbook CSV export format
+- EXIF metadata extraction
+
+Requires: FLICKR_API_KEY environment variable set.
+Get an API key at: https://www.flickr.com/services/api/misc.api_keys.html
+
+Returns: Summary of downloaded photos and output file paths.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "species": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of species names to search for. Examples: ['whale shark'], ['African lion', 'Panthera leo']"
+                    },
+                    "days_back": {
+                        "type": "integer",
+                        "description": "Number of days back to search for photos (default: 30)",
+                        "default": 30
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of photos to download per species (default: 500)",
+                        "default": 500
+                    },
+                    "location_id": {
+                        "type": "string",
+                        "description": "Optional location ID to add to Encounter.locationID column"
+                    },
+                    "submitter_id": {
+                        "type": "string",
+                        "description": "Optional submitter ID to add to Encounter.submitterID column"
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Output directory path (default: './data')",
+                        "default": "./data"
+                    },
+                    "html_review": {
+                        "type": "boolean",
+                        "description": "Generate interactive HTML review page (default: true)",
+                        "default": True
+                    },
+                    "rate_limit": {
+                        "type": "number",
+                        "description": "Seconds to wait between API calls (default: 1.0)",
+                        "default": 1.0
+                    }
+                },
+                "required": ["species"]
+            }
         )
     ]
 
@@ -276,6 +343,8 @@ async def handle_call_tool(
         return await search_youtube_tool(arguments or {})
     elif name == "search_youtube_multilanguage":
         return await search_youtube_multilanguage_tool(arguments or {})
+    elif name == "download_flickr_observations":
+        return await download_flickr_tool(arguments or {})
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -737,6 +806,90 @@ async def search_youtube_multilanguage_tool(args: dict[str, Any]) -> list[types.
         import traceback
         error_msg = f"Error searching YouTube (multi-language): {str(e)}\n\n"
         error_msg += "Traceback:\n" + traceback.format_exc()
+        return [types.TextContent(type="text", text=error_msg)]
+
+async def download_flickr_tool(args: dict[str, Any]) -> list[types.TextContent]:
+    """Execute the download_flickr_observations tool."""
+
+    # Extract arguments
+    species_list = args.get("species", [])
+    days_back = args.get("days_back", 30)
+    max_results = args.get("max_results", 500)
+    location_id = args.get("location_id")
+    submitter_id = args.get("submitter_id")
+    output_dir = args.get("output_dir", "./data")
+    html_review = args.get("html_review", True)
+    rate_limit = args.get("rate_limit", 1.0)
+
+    # Validate
+    if not species_list:
+        return [types.TextContent(
+            type="text",
+            text="Error: At least one species must be specified"
+        )]
+
+    # Check for API key
+    if not os.getenv('FLICKR_API_KEY'):
+        error_msg = (
+            "❌ **Error: Flickr API Key Required**\n\n"
+            "The FLICKR_API_KEY environment variable is not set.\n\n"
+            "To get a Flickr API key:\n"
+            "1. Visit: https://www.flickr.com/services/api/misc.api_keys.html\n"
+            "2. Sign in with your Flickr/Yahoo account\n"
+            "3. Create a new app to get your API key\n"
+            "4. Set the environment variable: export FLICKR_API_KEY='your-key-here'\n"
+        )
+        return [types.TextContent(type="text", text=error_msg)]
+
+    try:
+        # Create downloader
+        downloader = FlickrDownloader(
+            output_dir=output_dir,
+            days_back=days_back,
+            species_list=species_list,
+            rate_limit=rate_limit,
+            html_review=html_review,
+            location_id=location_id,
+            submitter_id=submitter_id
+        )
+
+        # Run the download
+        result = downloader.run()
+
+        # Build success message
+        species_names = ', '.join(species_list)
+        output_msg = (
+            f"✅ **Flickr Download Complete**\n\n"
+            f"**Summary:**\n"
+        )
+
+        for species, count in result['species_counts'].items():
+            output_msg += f"✓ {species}: {count} photos downloaded\n"
+
+        output_msg += f"\n**Total observations processed:** {result['total_observations']}\n"
+        output_msg += f"**Date range:** Last {days_back} days\n"
+
+        if result['output_files']:
+            output_msg += f"\n**Output files:**\n"
+            for filepath in result['output_files']:
+                output_msg += f"- {filepath}\n"
+
+        output_msg += "\n**Next steps:**\n"
+        output_msg += "1. Open the HTML file in a web browser\n"
+        output_msg += "2. Review photos and deselect any you don't want to import\n"
+        output_msg += "3. Use the 'CSV Export' tab to download the final CSV for Wildbook import"
+
+        return [types.TextContent(type="text", text=output_msg)]
+
+    except ValueError as e:
+        error_msg = f"❌ **Error:** {str(e)}"
+        return [types.TextContent(type="text", text=error_msg)]
+    except Exception as e:
+        error_msg = (
+            f"❌ **Error downloading from Flickr:**\n\n"
+            f"{type(e).__name__}: {str(e)}\n\n"
+            f"Please check your Flickr API key and try again."
+        )
         return [types.TextContent(type="text", text=error_msg)]
 
 async def main():
