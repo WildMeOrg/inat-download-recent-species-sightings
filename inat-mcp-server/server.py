@@ -34,7 +34,7 @@ spec.loader.exec_module(inat_module)
 iNaturalistDownloader = inat_module.iNaturalistDownloader
 
 # Import YouTube tools
-from youtube_tools import YouTubeSearcher, format_video_results
+from youtube_tools import YouTubeSearcher, format_video_results, generate_html_report
 
 # Create MCP server instance
 server = Server("inat-wildbook-integration")
@@ -601,6 +601,27 @@ async def search_youtube_tool(args: dict[str, Any]) -> list[types.TextContent]:
 
         result += format_video_results(videos, include_descriptions=True)
 
+        # Generate HTML report
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        species_safe = species.replace(" ", "-").replace("/", "-")
+        html_filename = f"youtube_videos_{species_safe}_{days_back}days_{timestamp}.html"
+        html_path = f"./data/youtube_reports/{html_filename}"
+
+        search_params = {
+            'species': species,
+            'days_back': days_back
+        }
+        if additional_keywords:
+            search_params['additional_keywords'] = additional_keywords
+        if exclude_keywords:
+            search_params['exclude_keywords'] = exclude_keywords
+
+        html_file = generate_html_report(videos, html_path, search_params)
+
+        result += f"\n\n**HTML Report:** {html_file}\n"
+        result += f"Open this file in a web browser to view embedded videos and export selected results."
+
         return [types.TextContent(type="text", text=result)]
 
     except Exception as e:
@@ -686,6 +707,29 @@ async def search_youtube_multilanguage_tool(args: dict[str, Any]) -> list[types.
         result += f"\n**Videos by matched language:**\n"
         for lang, count in sorted(language_counts.items(), key=lambda x: x[1], reverse=True):
             result += f"- {lang}: {count}\n"
+
+        # Generate HTML report
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Use first species name as filename base
+        first_species = list(species_names.values())[0] if species_names else "multilang"
+        species_safe = first_species.replace(" ", "-").replace("/", "-")
+        html_filename = f"youtube_multilang_{species_safe}_{days_back}days_{timestamp}.html"
+        html_path = f"./data/youtube_reports/{html_filename}"
+
+        search_params = {
+            'species_names': species_names,
+            'days_back': days_back
+        }
+        if additional_keywords:
+            search_params['additional_keywords'] = additional_keywords
+        if exclude_keywords:
+            search_params['exclude_keywords'] = exclude_keywords
+
+        html_file = generate_html_report(videos, html_path, search_params)
+
+        result += f"\n\n**HTML Report:** {html_file}\n"
+        result += f"Open this file in a web browser to view embedded videos and export selected results."
 
         return [types.TextContent(type="text", text=result)]
 
