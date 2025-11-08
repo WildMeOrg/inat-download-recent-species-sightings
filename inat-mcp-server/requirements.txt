@@ -1,9 +1,13 @@
 # MCP Server Dependencies
 mcp>=0.9.0
 
-# Note: YouTube search tools use only Python standard library (urllib, json)
-# No additional dependencies required for YouTube functionality
+# NLP for date extraction from YouTube video metadata
+spacy>=3.7.0
+dateparser>=1.2.0
+
+# Note: YouTube search tools use Python standard library for API calls (urllib, json)
 # Requires YOUTUBE_API_KEY environment variable
+# After installing requirements, download spaCy model: python -m spacy download en_core_web_sm
 
 # Optional: For CLIP-based image filtering (if implementing in the future)
 # transformers>=4.30.0
