@@ -756,7 +756,9 @@ class iNaturalistDownloader:
             'url',
             'Encounter.researcherComments',
             'photo_count',
-            'photo_filenames'
+            'photo_filenames',
+            '_has_non_organism_evidence',
+            '_is_skulls_and_bones'
         ]
 
         # Add photo asset columns and license columns
