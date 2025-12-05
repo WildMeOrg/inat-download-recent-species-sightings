@@ -42,7 +42,8 @@ class FlickrDownloader:
         html_review: bool = True,
         location_id: str = None,
         submitter_id: str = None,
-        api_key: str = None
+        api_key: str = None,
+        project_owner: str = None
     ):
         """
         Initialize the Flickr downloader.
@@ -56,6 +57,7 @@ class FlickrDownloader:
             location_id: Optional location ID for Wildbook
             submitter_id: Optional submitter ID for Wildbook
             api_key: Flickr API key (or set FLICKR_API_KEY env var)
+            project_owner: Optional Wildbook username to own the project
         """
         self.output_dir = Path(output_dir)
         self.days_back = days_back
@@ -64,6 +66,7 @@ class FlickrDownloader:
         self.html_review = html_review
         self.location_id = location_id
         self.submitter_id = submitter_id
+        self.project_owner = project_owner
         self.photos_dir = self.output_dir / "photos"
 
         # Get API key from parameter or environment
@@ -85,6 +88,24 @@ class FlickrDownloader:
         start_date = end_date - timedelta(days=self.days_back)
         # Flickr expects Unix timestamps
         return int(start_date.timestamp()), int(end_date.timestamp())
+
+    def generate_project_name(self, genus: str, specific_epithet: str) -> str:
+        """
+        Generate a Wildbook project name in the format: Flickr-genus-specificEpithet
+
+        Args:
+            genus: The genus name (e.g., "Panthera")
+            specific_epithet: The specific epithet (e.g., "leo")
+
+        Returns:
+            Project name in lowercase format (e.g., "Flickr-panthera-leo")
+        """
+        if genus and specific_epithet:
+            return f"Flickr-{genus.lower()}-{specific_epithet.lower()}"
+        elif genus:
+            return f"Flickr-{genus.lower()}"
+        else:
+            return "Flickr-unknown"
 
     def resolve_species(self, species_query: str) -> Optional[Dict[str, Any]]:
         """
@@ -415,6 +436,9 @@ class FlickrDownloader:
             # Use taxonomy resolved at the beginning of this method
             # (scientific_name, common_name, genus, specific_epithet already set)
 
+            # Generate project name based on species taxonomy
+            project_name = self.generate_project_name(genus, specific_epithet)
+
             # Build observation dictionary matching iNaturalist format
             observation = {
                 'observation_id': f"flickr_{photo.get('id')}",
@@ -433,6 +457,8 @@ class FlickrDownloader:
                 'Encounter.locationID': self.location_id or '',
                 'Encounter.livingStatus': 'alive',
                 'Encounter.submitterID': self.submitter_id or 'public',
+                'Encounter.project0.researchProjectName': project_name,
+                'Encounter.project0.ownerUsername': self.project_owner if self.project_owner else None,
                 'Sighting.sightingID': f"flickr_sighting_{photo.get('id')}",
                 'observer': photo.get('ownername', 'Unknown'),
                 'quality_grade': 'community',  # Flickr doesn't have quality grades
@@ -546,6 +572,8 @@ class FlickrDownloader:
                 'location_id': row.get('Encounter.locationID'),
                 'living_status': row.get('Encounter.livingStatus'),
                 'submitter_id': row.get('Encounter.submitterID'),
+                'project_name': row.get('Encounter.project0.researchProjectName'),
+                'project_owner': row.get('Encounter.project0.ownerUsername'),
                 'sighting_id': row.get('Sighting.sightingID'),
                 'sighting_remarks': row.get('Encounter.sightingRemarks', ''),
                 'observer': row.get('observer'),
@@ -975,6 +1003,7 @@ class FlickrDownloader:
             csv += 'scientific_name,Encounter.genus,Encounter.specificEpithet,common_name,';
             csv += 'Encounter.decimalLatitude,Encounter.decimalLongitude,Encounter.verbatimLocality,';
             csv += 'Encounter.locationID,Encounter.livingStatus,Encounter.submitterID,';
+            csv += 'Encounter.project0.researchProjectName,Encounter.project0.ownerUsername,';
             csv += 'Sighting.sightingID,Encounter.sightingRemarks,observer,quality_grade,url,Encounter.researcherComments,';
             csv += 'Encounter.mediaAsset0,Encounter.mediaAsset0.license\\n';
 
@@ -1003,6 +1032,8 @@ class FlickrDownloader:
                     escape(obs.location_id),
                     escape(obs.living_status),
                     escape(obs.submitter_id),
+                    escape(obs.project_name),
+                    escape(obs.project_owner),
                     escape(obs.sighting_id),
                     escape(obs.sighting_remarks),
                     escape(obs.observer),

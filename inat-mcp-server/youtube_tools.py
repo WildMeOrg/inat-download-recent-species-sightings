@@ -1322,7 +1322,9 @@ def generate_html_report(
 
     # Write HTML file
     output_file = Path(output_path)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    # Only create parent directory if it doesn't exist and isn't the current directory
+    if output_file.parent != Path('.') and not output_file.parent.exists():
+        output_file.parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(html_content)

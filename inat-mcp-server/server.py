@@ -107,6 +107,10 @@ Returns: Summary of downloaded observations and output file paths.""",
                         "type": "number",
                         "description": "Seconds to wait between API calls (default: 1.0)",
                         "default": 1.0
+                    },
+                    "project_owner": {
+                        "type": "string",
+                        "description": "Optional Wildbook username to own the project (required for creating new projects). Projects are auto-named as 'iNaturalist-genus-specificepithet' (e.g., 'iNaturalist-panthera-leo')."
                     }
                 },
                 "required": ["species"]
@@ -320,6 +324,10 @@ Returns: Summary of downloaded photos and output file paths.""",
                         "type": "number",
                         "description": "Seconds to wait between API calls (default: 1.0)",
                         "default": 1.0
+                    },
+                    "project_owner": {
+                        "type": "string",
+                        "description": "Optional Wildbook username to own the project (required for creating new projects). Projects are auto-named as 'Flickr-genus-specificepithet' (e.g., 'Flickr-panthera-leo')."
                     }
                 },
                 "required": ["species"]
@@ -361,6 +369,7 @@ async def download_observations_tool(args: dict[str, Any]) -> list[types.TextCon
     html_review = args.get("html_review", True)
     social_split = args.get("social_split", False)
     rate_limit = args.get("rate_limit", 1.0)
+    project_owner = args.get("project_owner")
 
     # Validate
     if not species_list:
@@ -380,7 +389,8 @@ async def download_observations_tool(args: dict[str, Any]) -> list[types.TextCon
             place=place,
             location_id=location_id,
             submitter_id=submitter_id,
-            social_split=social_split
+            social_split=social_split,
+            project_owner=project_owner
         )
 
         # Resolve place if specified
@@ -675,7 +685,7 @@ async def search_youtube_tool(args: dict[str, Any]) -> list[types.TextContent]:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         species_safe = species.replace(" ", "-").replace("/", "-")
         html_filename = f"youtube_videos_{species_safe}_{days_back}days_{timestamp}.html"
-        html_path = f"./data/youtube_reports/{html_filename}"
+        html_path = f"./data/{html_filename}"
 
         search_params = {
             'species': species,
@@ -784,7 +794,7 @@ async def search_youtube_multilanguage_tool(args: dict[str, Any]) -> list[types.
         first_species = list(species_names.values())[0] if species_names else "multilang"
         species_safe = first_species.replace(" ", "-").replace("/", "-")
         html_filename = f"youtube_multilang_{species_safe}_{days_back}days_{timestamp}.html"
-        html_path = f"./data/youtube_reports/{html_filename}"
+        html_path = f"./data/{html_filename}"
 
         search_params = {
             'species_names': species_names,
@@ -820,6 +830,7 @@ async def download_flickr_tool(args: dict[str, Any]) -> list[types.TextContent]:
     output_dir = args.get("output_dir", "./data")
     html_review = args.get("html_review", True)
     rate_limit = args.get("rate_limit", 1.0)
+    project_owner = args.get("project_owner")
 
     # Validate
     if not species_list:
@@ -850,7 +861,8 @@ async def download_flickr_tool(args: dict[str, Any]) -> list[types.TextContent]:
             rate_limit=rate_limit,
             html_review=html_review,
             location_id=location_id,
-            submitter_id=submitter_id
+            submitter_id=submitter_id,
+            project_owner=project_owner
         )
 
         # Run the download

@@ -26,7 +26,7 @@ class iNaturalistDownloader:
 
     BASE_URL = "https://api.inaturalist.org/v1"
 
-    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None, social_split: bool = False, clip_filter: str = None):
+    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None, social_split: bool = False, clip_filter: str = None, project_owner: str = None):
         """
         Initialize the downloader.
 
@@ -41,6 +41,7 @@ class iNaturalistDownloader:
             submitter_id: Optional submitter ID to add to all observations in Encounter.submitterID column
             social_split: Split multi-photo observations into separate rows with shared sighting ID (default: False)
             clip_filter: Optional CLIP text prompts to filter out images (comma-separated, e.g., "footprint,track,paw print")
+            project_owner: Optional Wildbook username to own the project (required for new projects)
         """
         self.output_dir = Path(output_dir)
         self.days_back = days_back
@@ -53,6 +54,7 @@ class iNaturalistDownloader:
         self.submitter_id = submitter_id
         self.social_split = social_split
         self.clip_filter = clip_filter
+        self.project_owner = project_owner
         self.photos_dir = self.output_dir / "photos"
 
         # CLIP model (lazy-loaded when needed)
@@ -68,6 +70,24 @@ class iNaturalistDownloader:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=self.days_back)
         return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+
+    def generate_project_name(self, genus: str, specific_epithet: str) -> str:
+        """
+        Generate a Wildbook project name in the format: iNaturalist-genus-specificEpithet
+
+        Args:
+            genus: The genus name (e.g., "Panthera")
+            specific_epithet: The specific epithet (e.g., "leo")
+
+        Returns:
+            Project name in lowercase format (e.g., "iNaturalist-panthera-leo")
+        """
+        if genus and specific_epithet:
+            return f"iNaturalist-{genus.lower()}-{specific_epithet.lower()}"
+        elif genus:
+            return f"iNaturalist-{genus.lower()}"
+        else:
+            return "iNaturalist-unknown"
 
     def search_species(self, species_name: str) -> int:
         """
@@ -457,6 +477,12 @@ class iNaturalistDownloader:
             # Quality grade
             quality_grade = obs.get('quality_grade', 'Unknown')
 
+            # Geoprivacy - check if coordinates are obscured
+            obscured = obs.get('obscured', False)
+            geoprivacy = obs.get('geoprivacy')  # User-set: None/open, obscured, private
+            taxon_geoprivacy = obs.get('taxon_geoprivacy')  # Auto: open, obscured
+            public_positional_accuracy = obs.get('public_positional_accuracy')  # Accuracy in meters (inflated if obscured)
+
             # URL
             obs_url = f"https://www.inaturalist.org/observations/{obs_id}"
 
@@ -577,6 +603,9 @@ class iNaturalistDownloader:
                 else:
                     researcher_comments += "<br>License: None specified. Copyright applies."
 
+            # Generate project name based on species taxonomy
+            project_name = self.generate_project_name(encounter_genus, encounter_specific_epithet)
+
             # If social_split is enabled and there are multiple photos, create one row per photo
             # BUT only if the observation is NOT marked as single subject
             if self.social_split and len(photo_filenames) > 1 and not is_single_subject:
@@ -602,6 +631,8 @@ class iNaturalistDownloader:
                         'Encounter.livingStatus': living_status,
                         'Encounter.submitterID': self.submitter_id if self.submitter_id else 'public',
                         'Encounter.state': 'unapproved',
+                        'Encounter.project0.researchProjectName': project_name,
+                        'Encounter.project0.ownerUsername': self.project_owner if self.project_owner else None,
                         'observer': observer,
                         'quality_grade': quality_grade,
                         'url': obs_url,
@@ -612,7 +643,11 @@ class iNaturalistDownloader:
                         '_photo_list': [photo_filename],  # Single photo for this encounter
                         '_license_list': [photo_license],  # Single license for this encounter
                         '_has_non_organism_evidence': has_non_organism_evidence,  # For HTML deselection
-                        '_is_skulls_and_bones': is_skulls_and_bones  # For HTML deselection
+                        '_is_skulls_and_bones': is_skulls_and_bones,  # For HTML deselection
+                        '_coordinates_obscured': obscured,  # For HTML display
+                        '_geoprivacy': geoprivacy,  # User-set geoprivacy
+                        '_taxon_geoprivacy': taxon_geoprivacy,  # Auto geoprivacy from conservation status
+                        '_public_positional_accuracy': public_positional_accuracy  # Accuracy in meters
                     }
                     processed_data.append(row)
             else:
@@ -637,6 +672,8 @@ class iNaturalistDownloader:
                     'Encounter.livingStatus': living_status,
                     'Encounter.submitterID': self.submitter_id if self.submitter_id else 'public',
                     'Encounter.state': 'unapproved',
+                    'Encounter.project0.researchProjectName': project_name,
+                    'Encounter.project0.ownerUsername': self.project_owner if self.project_owner else None,
                     'observer': observer,
                     'quality_grade': quality_grade,
                     'url': obs_url,
@@ -647,7 +684,11 @@ class iNaturalistDownloader:
                     '_photo_list': photo_filenames,  # Temporary field for photo processing
                     '_license_list': photo_licenses,  # Temporary field for license processing
                     '_has_non_organism_evidence': has_non_organism_evidence,  # For HTML deselection
-                    '_is_skulls_and_bones': is_skulls_and_bones  # For HTML deselection
+                    '_is_skulls_and_bones': is_skulls_and_bones,  # For HTML deselection
+                    '_coordinates_obscured': obscured,  # For HTML display
+                    '_geoprivacy': geoprivacy,  # User-set geoprivacy
+                    '_taxon_geoprivacy': taxon_geoprivacy,  # Auto geoprivacy from conservation status
+                    '_public_positional_accuracy': public_positional_accuracy  # Accuracy in meters
                 }
                 processed_data.append(row)
 
@@ -707,6 +748,8 @@ class iNaturalistDownloader:
             'Encounter.livingStatus',
             'Encounter.submitterID',
             'Encounter.state',
+            'Encounter.project0.researchProjectName',
+            'Encounter.project0.ownerUsername',
             'Sighting.sightingID',
             'observer',
             'quality_grade',
@@ -794,6 +837,8 @@ class iNaturalistDownloader:
                 'location_id': row.get('Encounter.locationID'),
                 'living_status': row.get('Encounter.livingStatus'),
                 'submitter_id': row.get('Encounter.submitterID'),
+                'project_name': row.get('Encounter.project0.researchProjectName'),
+                'project_owner': row.get('Encounter.project0.ownerUsername'),
                 'sighting_id': row.get('Sighting.sightingID'),
                 'observer': row.get('observer'),
                 'quality_grade': row.get('quality_grade'),
@@ -804,6 +849,10 @@ class iNaturalistDownloader:
                 'license_display': license_display,
                 'has_non_organism_evidence': row.get('_has_non_organism_evidence', False),
                 'is_skulls_and_bones': row.get('_is_skulls_and_bones', False),
+                'coordinates_obscured': row.get('_coordinates_obscured', False),
+                'geoprivacy': row.get('_geoprivacy'),
+                'taxon_geoprivacy': row.get('_taxon_geoprivacy'),
+                'public_positional_accuracy': row.get('_public_positional_accuracy'),
                 'photo_path': photo_path,
                 'all_photo_paths': all_photo_paths,
                 'photos': [],
@@ -1105,6 +1154,29 @@ class iNaturalistDownloader:
             color: #856404;
         }}
 
+        .obscured-badge {{
+            display: inline-block;
+            padding: 3px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            background: #ffcdd2;
+            color: #c62828;
+            margin-left: 4px;
+        }}
+
+        .obscured-badge.taxon {{
+            background: #ffe0b2;
+            color: #e65100;
+        }}
+
+        .accuracy-info {{
+            font-size: 10px;
+            color: #999;
+            margin-top: 2px;
+        }}
+
         .quality-casual {{
             background: #f8d7da;
             color: #721c24;
@@ -1264,6 +1336,10 @@ class iNaturalistDownloader:
                     <span class="stat-label">Selected</span>
                     <span class="stat-value" id="selected-count">0</span>
                 </div>
+                <div class="stat">
+                    <span class="stat-label">GPS Obscured</span>
+                    <span class="stat-value" id="obscured-count" style="color: #e65100;">0</span>
+                </div>
             </div>
 
             <div class="controls">
@@ -1281,6 +1357,7 @@ class iNaturalistDownloader:
                             <th>Date</th>
                             <th>Species</th>
                             <th>Location</th>
+                            <th>GPS</th>
                             <th>Observer</th>
                             <th>Quality</th>
                             <th>License</th>
@@ -1517,15 +1594,54 @@ class iNaturalistDownloader:
                 if (obs.location) {{
                     locationDiv.textContent = obs.location;
                 }}
-                if (obs.latitude && obs.longitude) {{
-                    const coords = document.createElement('div');
-                    coords.style.fontSize = '11px';
-                    coords.style.color = '#999';
-                    coords.textContent = `${{obs.latitude}}, ${{obs.longitude}}`;
-                    locationDiv.appendChild(coords);
-                }}
                 tdLocation.appendChild(locationDiv);
                 tr.appendChild(tdLocation);
+
+                // GPS Status (coordinates + obscured indicator)
+                const tdGps = document.createElement('td');
+                const gpsDiv = document.createElement('div');
+
+                if (obs.latitude && obs.longitude) {{
+                    // Show coordinates
+                    const coords = document.createElement('div');
+                    coords.style.fontSize = '11px';
+                    coords.style.color = '#666';
+                    coords.textContent = `${{parseFloat(obs.latitude).toFixed(4)}}, ${{parseFloat(obs.longitude).toFixed(4)}}`;
+                    gpsDiv.appendChild(coords);
+
+                    // Show obscured badge if coordinates are obscured
+                    if (obs.coordinates_obscured) {{
+                        const badge = document.createElement('span');
+                        badge.className = 'obscured-badge' + (obs.taxon_geoprivacy === 'obscured' ? ' taxon' : '');
+                        badge.textContent = obs.taxon_geoprivacy === 'obscured' ? 'TAXON' : 'OBSCURED';
+                        badge.title = obs.taxon_geoprivacy === 'obscured'
+                            ? 'Coordinates obscured due to species conservation status'
+                            : 'Coordinates obscured by observer';
+                        gpsDiv.appendChild(badge);
+
+                        // Show accuracy if available
+                        if (obs.public_positional_accuracy) {{
+                            const accuracy = document.createElement('div');
+                            accuracy.className = 'accuracy-info';
+                            const km = (obs.public_positional_accuracy / 1000).toFixed(1);
+                            accuracy.textContent = `±${{km}}km uncertainty`;
+                            gpsDiv.appendChild(accuracy);
+                        }}
+                    }} else {{
+                        // Show exact indicator
+                        const exact = document.createElement('div');
+                        exact.style.fontSize = '10px';
+                        exact.style.color = '#4caf50';
+                        exact.textContent = '✓ Exact';
+                        gpsDiv.appendChild(exact);
+                    }}
+                }} else {{
+                    gpsDiv.textContent = 'No GPS';
+                    gpsDiv.style.color = '#999';
+                }}
+
+                tdGps.appendChild(gpsDiv);
+                tr.appendChild(tdGps);
 
                 // Observer
                 const tdObserver = document.createElement('td');
@@ -1579,9 +1695,11 @@ class iNaturalistDownloader:
         function updateStats() {{
             const total = observations.length;
             const selected = getSelectedObservations().length;
+            const obscured = observations.filter(obs => obs.coordinates_obscured).length;
 
             document.getElementById('total-count').textContent = total;
             document.getElementById('selected-count').textContent = selected;
+            document.getElementById('obscured-count').textContent = obscured;
         }}
 
         function getSelectedObservations() {{
@@ -1697,6 +1815,8 @@ class iNaturalistDownloader:
                 'Encounter.livingStatus',
                 'Encounter.submitterID',
                 'Encounter.state',
+                'Encounter.project0.researchProjectName',
+                'Encounter.project0.ownerUsername',
                 'Sighting.sightingID',
                 'observer',
                 'quality_grade',
@@ -1733,6 +1853,8 @@ class iNaturalistDownloader:
                     escapeCSV(obs.living_status),
                     escapeCSV(obs.submitter_id),
                     escapeCSV('unapproved'),  // Encounter.state - always unapproved
+                    escapeCSV(obs.project_name),
+                    escapeCSV(obs.project_owner),
                     escapeCSV(obs.sighting_id),
                     escapeCSV(obs.observer),
                     escapeCSV(obs.quality_grade),
@@ -2096,6 +2218,13 @@ Examples:
         help='Split multi-photo observations into separate rows (one per photo) with shared Sighting.sightingID for social species'
     )
 
+    parser.add_argument(
+        '--project-owner',
+        type=str,
+        default=None,
+        help='Wildbook username to own the project (required for creating new projects in Wildbook)'
+    )
+
     args = parser.parse_args()
 
     # Validate inputs
@@ -2117,7 +2246,8 @@ Examples:
         place=args.place,
         location_id=args.use_locationID,
         submitter_id=args.use_submitterID,
-        social_split=args.social_split_observations
+        social_split=args.social_split_observations,
+        project_owner=args.project_owner
     )
 
     try:
