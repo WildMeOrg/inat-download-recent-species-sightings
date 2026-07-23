@@ -407,4 +407,6 @@ This script uses the [iNaturalist API v1](https://api.inaturalist.org/v1/docs/),
 
 For issues or questions, please check the iNaturalist API documentation or community forums.
 
-Copyright Conservation X Labs 2025. All rights reserved.
+## License
+
+Copyright (c) 2025 Conservation X Labs. Released under the [MIT License](LICENSE).
