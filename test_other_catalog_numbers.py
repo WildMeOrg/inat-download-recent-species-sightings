@@ -52,7 +52,8 @@ def test_html_export_includes_column():
         rows = d.process_observations([FAKE_OBS], "Panthera onca")
         d.write_html(rows, "review.html")
         html = (Path(tmp) / "review.html").read_text(encoding="utf-8")
-        assert "Encounter.otherCatalogNumbers" in html
+        assert "Encounter.otherCatalogNumbers" in html  # column header
+        assert "iNaturalist:12345678" in html  # value actually flows through the JS row builder
 
 
 def test_write_csv_strips_geoprivacy_fields_without_raising():
