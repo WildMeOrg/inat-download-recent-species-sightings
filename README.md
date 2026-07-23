@@ -2,6 +2,13 @@
 
 A Python utility for downloading recent observations of specific species from iNaturalist, including observation data (CSV) and photos. Created for the Wildbook program to help incorporate iNaturalist sightings into Wildbook via bulk import.
 
+## Scope
+
+The supported, maintained entry point is **`inat-download-new-species-sightings.py`** — the
+iNaturalist → Wildbook downloader. The `inat-mcp-server/` directory (YouTube and Flickr search,
+experimental CLIP filtering) is legacy and **not** part of the Wildbook import workflow; it is
+kept for reference only and may be removed in a future release.
+
 ## Features
 
 - Downloads observations from iNaturalist for specified species
@@ -314,6 +321,7 @@ The CSV file contains the following columns:
 | Encounter.decimalLatitude | Latitude coordinate in decimal degrees |
 | Encounter.decimalLongitude | Longitude coordinate in decimal degrees |
 | Encounter.verbatimLocality | Location description as entered by observer |
+| Encounter.otherCatalogNumbers | External source reference `iNaturalist:<observation_id>` — lets Wildbook detect whether this observation was already imported |
 | Encounter.locationID | Custom location ID (set via --use-locationID) |
 | Encounter.livingStatus | Living status of organism ("alive", "dead", or empty) |
 | Encounter.submitterID | Custom submitter ID (set via --use-submitterID) |
@@ -330,6 +338,13 @@ The CSV file contains the following columns:
 | Encounter.mediaAsset2... | Additional photo columns (dynamically created) |
 
 **Note:** The number of `Encounter.mediaAsset` columns is determined by the maximum number of photos across all observations in the dataset. Observations with fewer photos will have empty cells in the extra columns.
+
+## Using the output with Wildbook
+
+The generated CSV and `photos/` folder are ready for Wildbook's **Bulk Import** page: upload the
+photo folder, then the CSV. Every encounter is written as `unapproved` so your team can verify it
+before it enters analyses. The `Encounter.otherCatalogNumbers` column carries an
+`iNaturalist:<id>` back-reference so a record can later be recognised as already imported.
 
 ### Photo Files
 
