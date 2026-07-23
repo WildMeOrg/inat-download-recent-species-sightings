@@ -636,6 +636,7 @@ class iNaturalistDownloader:
                         'observer': observer,
                         'quality_grade': quality_grade,
                         'url': obs_url,
+                        'Encounter.otherCatalogNumbers': f'iNaturalist:{obs_id}',
                         'Encounter.researcherComments': researcher_comments,
                         'Sighting.sightingID': sighting_id,
                         'photo_count': 1,  # Each row has one photo
@@ -677,6 +678,7 @@ class iNaturalistDownloader:
                     'observer': observer,
                     'quality_grade': quality_grade,
                     'url': obs_url,
+                    'Encounter.otherCatalogNumbers': f'iNaturalist:{obs_id}',
                     'Encounter.researcherComments': researcher_comments,
                     'Sighting.sightingID': sighting_id,
                     'photo_count': len(photo_filenames),
@@ -729,6 +731,10 @@ class iNaturalistDownloader:
             # Remove temporary fields
             del row['_photo_list']
             del row['_license_list']
+            row.pop('_coordinates_obscured', None)
+            row.pop('_geoprivacy', None)
+            row.pop('_taxon_geoprivacy', None)
+            row.pop('_public_positional_accuracy', None)
 
         # Build fieldnames with dynamic photo columns
         fieldnames = [
@@ -754,6 +760,7 @@ class iNaturalistDownloader:
             'observer',
             'quality_grade',
             'url',
+            'Encounter.otherCatalogNumbers',
             'Encounter.researcherComments',
             'photo_count',
             'photo_filenames',
@@ -845,6 +852,7 @@ class iNaturalistDownloader:
                 'observer': row.get('observer'),
                 'quality_grade': row.get('quality_grade'),
                 'url': row.get('url'),
+                'other_catalog_numbers': row.get('Encounter.otherCatalogNumbers'),
                 'researcher_comments': row.get('Encounter.researcherComments'),
                 'photo_count': len(photo_list),
                 'photo_filenames': '; '.join(photo_list),
@@ -1823,6 +1831,7 @@ class iNaturalistDownloader:
                 'observer',
                 'quality_grade',
                 'url',
+                'Encounter.otherCatalogNumbers',
                 'Encounter.researcherComments',
                 'photo_count',
                 'photo_filenames'
@@ -1861,6 +1870,7 @@ class iNaturalistDownloader:
                     escapeCSV(obs.observer),
                     escapeCSV(obs.quality_grade),
                     escapeCSV(obs.url),
+                    escapeCSV(obs.other_catalog_numbers),
                     escapeCSV(obs.researcher_comments),
                     escapeCSV(obs.photo_count),
                     escapeCSV(obs.photo_filenames)
