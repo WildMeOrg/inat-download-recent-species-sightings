@@ -15,6 +15,8 @@ Each test here pins down a bug that shipped once already:
    split observation back together dropped every photo past the first.
 """
 
+import copy
+import csv
 import importlib.util
 import json
 import re
@@ -226,25 +228,108 @@ def test_split_rows_by_photo_expands_eligible_rows():
 
 
 def test_split_rows_by_photo_leaves_ineligible_rows_alone():
-    """Single-photo rows, and organism-evidence rows, pass straight through."""
+    """Single-photo rows, and organism-evidence rows, are not expanded into
+    multiple rows -- but split_rows_by_photo only ever runs when social_split
+    is on, so they still get their Sighting.sightingID promoted, same as an
+    eligible row would (see the lone-row regression test below)."""
+
+    def _same_except_sighting_id(actual, original):
+        keys = [k for k in original if k != "Sighting.sightingID"]
+        return {k: actual[k] for k in keys} == {k: original[k] for k in keys}
+
     with tempfile.TemporaryDirectory() as tmp:
         d = _downloader(tmp, social_split=True)
         single = d.process_observations([_obs(n_photos=1)], "Panthera onca")
-        assert mod.split_rows_by_photo(single) == single
+        split_single = mod.split_rows_by_photo(single)
+        assert len(split_single) == 1
+        assert split_single[0]["Sighting.sightingID"] == single[0]["_sighting_id"]
+        assert _same_except_sighting_id(split_single[0], single[0])
 
         organism = _obs(n_photos=4)
         organism["annotations"] = [{"controlled_attribute_id": 22, "controlled_value_id": 24}]
         rows = d.process_observations([organism], "Panthera onca")
         assert rows[0]["_split_eligible"] is False
-        assert mod.split_rows_by_photo(rows) == rows
+        split_organism = mod.split_rows_by_photo(rows)
+        assert len(split_organism) == 1
+        assert split_organism[0]["Sighting.sightingID"] == rows[0]["_sighting_id"]
+        assert _same_except_sighting_id(split_organism[0], rows[0])
+
+
+def test_split_rows_by_photo_promotes_sighting_id_for_lone_row():
+    """Regression test: a lone row in a --social-split-observations run must
+    keep its Sighting.sightingID.
+
+    split_rows_by_photo is only called when social_split is on, so a row that
+    has nothing to split (one photo, or organism evidence) must still come out
+    with a promoted, non-empty sighting ID -- otherwise a single-photo
+    observation that used to produce a one-encounter Sighting in Wildbook
+    would silently lose it the moment --social-split-observations is passed.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _downloader(tmp, social_split=True)
+        rows = d.process_observations([_obs(n_photos=1)], "Panthera onca")
+        split = mod.split_rows_by_photo(rows)
+
+        assert len(split) == 1
+        assert split[0]["Sighting.sightingID"] == rows[0]["_sighting_id"]
+        assert split[0]["Sighting.sightingID"], "sighting ID must not be empty"
+
+        d.write_csv(split, "out.csv")
+        with open(Path(tmp) / "out.csv", encoding="utf-8", newline="") as f:
+            csv_rows = list(csv.reader(f))
+        header, data_row = csv_rows[0], csv_rows[1]
+        idx = header.index("Sighting.sightingID")
+        assert data_row[idx] == rows[0]["_sighting_id"], (
+            "CSV shows an empty cell instead of the promoted sighting ID"
+        )
+
+
+def test_split_rows_by_photo_preserves_per_photo_license_alignment():
+    """Each split row must carry only its own photo's licence, not e.g. the first.
+
+    Regression guard for an off-by-one in the license_list[photo_index] lookup:
+    uses three distinct licence codes so a misalignment can't hide behind
+    identical values.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _downloader(tmp, social_split=True)
+        obs = _obs(n_photos=3)
+        licenses = ["cc-by", "cc-by-nc", "cc0"]
+        for photo, license_code in zip(obs["photos"], licenses):
+            photo["license_code"] = license_code
+
+        rows = d.process_observations([obs], "Panthera onca")
+        assert rows[0]["_license_list"] == licenses, "fixture setup sanity check"
+
+        split = mod.split_rows_by_photo(rows)
+        assert len(split) == 3
+        assert [r["_license_list"] for r in split] == [[lic] for lic in licenses], (
+            "split rows did not preserve per-photo licence order"
+        )
+        # And it survives all the way into the exported CSV column. The three
+        # distinct licences also land in Encounter.researcherComments
+        # (comma-joined), so this field genuinely needs comma-aware CSV
+        # parsing rather than a naive split(",").
+        d.write_csv(split, "out.csv")
+        with open(Path(tmp) / "out.csv", encoding="utf-8", newline="") as f:
+            csv_rows = list(csv.reader(f))
+        header, data_rows = csv_rows[0], csv_rows[1:]
+        idx = header.index("Encounter.mediaAsset0.license")
+        assert [row[idx] for row in data_rows] == licenses
 
 
 def test_split_rows_by_photo_is_pure():
-    """It must not mutate its input; run() relies on that for the HTML path."""
+    """It must not mutate its input; run() relies on that for the HTML path.
+
+    The snapshot is a deep copy, not a shallow one: a shallow `dict(r)` would
+    share nested lists like _photo_list with `rows`, so an in-place mutation
+    (`.append()`, `.clear()`, etc.) would silently be reflected in `before`
+    too and the equality check below would never catch it.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         d = _downloader(tmp, social_split=True)
         rows = d.process_observations([_obs(n_photos=3)], "Panthera onca")
-        before = [dict(r) for r in rows]
+        before = copy.deepcopy(rows)
         mod.split_rows_by_photo(rows)
         assert rows == before
 

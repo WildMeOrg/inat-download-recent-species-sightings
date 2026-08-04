@@ -84,6 +84,13 @@ def split_rows_by_photo(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     Rows sharing an observation become one Wildbook Sighting: they all carry the
     observation's pre-generated _sighting_id in Sighting.sightingID.
 
+    This is only ever called when social_split is on, so *every* row it returns
+    gets a promoted sighting ID -- not just the ones that actually split. A lone
+    encounter (single photo, or organism-evidence so splitting is suppressed)
+    previously produced a one-encounter Sighting in Wildbook, and it must keep
+    doing so rather than silently losing its Sighting.sightingID just because it
+    had nothing to split.
+
     This runs *after* deduplication, which is deliberate. When splitting happened
     inside process_observations(), deduplicate_rows() saw the split rows and
     collapsed them back to one -- silently turning --social-split-observations
@@ -93,7 +100,8 @@ def split_rows_by_photo(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         rows: Processed observation rows, one per observation
 
     Returns:
-        A new list; the input rows are not modified
+        A new list of new row dicts; neither the input rows nor their contents
+        (e.g. _photo_list) are modified.
     """
     expanded = []
 
@@ -102,7 +110,9 @@ def split_rows_by_photo(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         license_list = row.get('_license_list', [])
 
         if not row.get('_split_eligible') or len(photo_list) <= 1:
-            expanded.append(row)
+            passthrough_row = dict(row)
+            passthrough_row['Sighting.sightingID'] = row['_sighting_id']
+            expanded.append(passthrough_row)
             continue
 
         for photo_index, photo_filename in enumerate(photo_list):
