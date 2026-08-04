@@ -390,7 +390,7 @@ The generated page's JavaScript has no real test coverage — the only existing 
 - Produces:
   - `js_harness/run_page.js` — invoked as `node js_harness/run_page.js <page.html> <script.js>`; loads the page's inline script in a `vm` context with a stubbed DOM, runs the assertion script, prints its output.
   - `test_review_page_js.py::run_js(html_path, assertions) -> str` — writes the assertion snippet to a temp file, shells out to node, returns stdout. Skips the test when node is absent.
-  - `test_review_page_js.py::build_page(tmp_path, n_photos=4, social_split=False, licenses=None, observations=None)` — generates a real review page. `observations` accepts a list of `{"id": int, "n_photos": int, "licenses": [...]}"` specs for multi-observation fixtures; the scalar form builds a single observation. Tests that assert on ordering or cross-observation behaviour MUST use the list form — a single observation makes such assertions vacuous.
+  - `test_review_page_js.py::build_page(tmp_path, n_photos=4, social_split=False, licenses=None, specs=None)` — generates a real review page. The keyword is **`specs`**, taking a list of `{"id": int, "n_photos": int, "licenses": [...]}` dicts for multi-observation fixtures; the scalar `n_photos`/`licenses` form builds a single observation. Tests that assert on ordering or cross-observation behaviour MUST use `specs` — a single observation makes such assertions vacuous.
 
 - [ ] **Step 1: Write the harness**
 
@@ -662,7 +662,7 @@ def test_split_rows_stay_adjacent_after_sorting(tmp_path):
     split one's first photo deselected so the sort actually has work to do, is
     the smallest fixture that can detect scattering.
     """
-    page = build_page(tmp_path, observations=[
+    page = build_page(tmp_path, specs=[
         {"id": 111, "n_photos": 3},
         {"id": 222, "n_photos": 2},
     ])
