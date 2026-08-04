@@ -1,40 +1,53 @@
 #!/usr/bin/env python3
-"""Test if Apex Realms video is properly filtered out"""
+"""Regression test: the Apex Realms AI-generated video must stay out of reports.
+
+This was previously a print-only script — it reported "✗ FAILURE" in its output
+but always exited 0, so a regression here would never have failed a test run.
+The fixture is a real video that prompted the AI-content filtering, and it needs
+no API key or network: evaluate_wild_sighting_likelihood is a pure function of
+the video metadata.
+"""
 
 import sys
-sys.path.insert(0, '/mnt/c/inat-download-recent-species-sightings/inat-mcp-server')
+from pathlib import Path
 
-from youtube_tools import evaluate_wild_sighting_likelihood
+sys.path.insert(0, str(Path(__file__).parent / "inat-mcp-server"))
 
-# Simulate the Apex Realms video
-apex_realms_video = {
+from youtube_tools import evaluate_wild_sighting_likelihood  # noqa: E402
+
+# A real AI-generated video, kept verbatim as the fixture.
+APEX_REALMS_VIDEO = {
     'video_id': 'CqypdJMpRuI',
     'title': 'Whale Shark Feeds Vertically Creating Glowing Plankton Tornado While Divers Watch in Awe',
-    'description': 'Adult scuba divers on guided tour witness magical moment when massive whale shark positions itself completely vertical in water column and begins filter feeding, creating a spectacular glowing tornado of bioluminescent plankton spiraling into its mouth. The shark then makes eye contact with divers before performing an even larger vertical feeding display with multiple rotations.',
+    'description': (
+        'Adult scuba divers on guided tour witness magical moment when massive whale shark '
+        'positions itself completely vertical in water column and begins filter feeding, '
+        'creating a spectacular glowing tornado of bioluminescent plankton spiraling into its '
+        'mouth. The shark then makes eye contact with divers before performing an even larger '
+        'vertical feeding display with multiple rotations.'
+    ),
     'channel_title': 'Apex Realms',
     'channel_id': 'UCKvE37aBMdDY4ajyBO16qUA',
-    'published_at': '2025-11-08T00:21:50Z'
+    'published_at': '2025-11-08T00:21:50Z',
 }
 
-print("=" * 80)
-print("TESTING APEX REALMS AI-GENERATED VIDEO FILTERING")
-print("=" * 80)
+# generate_html_report() only includes videos scoring above this.
+REPORT_THRESHOLD = 90
 
-eval_result = evaluate_wild_sighting_likelihood(apex_realms_video)
 
-print(f"\n📹 VIDEO: {apex_realms_video['title']}")
-print(f"📺 CHANNEL: {apex_realms_video['channel_title']}")
-print(f"\n🎯 CONFIDENCE SCORE: {eval_result['score']}%")
-print(f"✅ LIKELY WILD: {eval_result['is_likely_wild']}")
-print(f"❌ INCLUDED IN REPORT (>90%): {'YES' if eval_result['score'] > 90 else 'NO'}")
+def test_ai_generated_video_is_excluded_from_the_report():
+    result = evaluate_wild_sighting_likelihood(APEX_REALMS_VIDEO)
+    assert result['score'] <= REPORT_THRESHOLD, (
+        f"AI-generated video scored {result['score']}% and would be included in the "
+        f"report; reasons: {result['reasons']}"
+    )
 
-print(f"\n📊 FILTERING REASONS:")
-for reason in eval_result['reasons']:
-    print(f"  • {reason}")
 
-print("\n" + "=" * 80)
-if eval_result['score'] <= 90:
-    print("✓ SUCCESS: AI-generated video properly EXCLUDED from report")
-else:
-    print("✗ FAILURE: AI-generated video would be INCLUDED (needs stricter filtering)")
-print("=" * 80)
+def test_the_ai_channel_is_what_triggers_the_exclusion():
+    """Pin the reason, not just the score, so a coincidental pass is visible."""
+    result = evaluate_wild_sighting_likelihood(APEX_REALMS_VIDEO)
+    assert 'AI-generated content channel' in result['reasons'], result['reasons']
+
+
+if __name__ == "__main__":
+    sys.exit(__import__("pytest").main([__file__, "-q"]))
