@@ -142,10 +142,12 @@ def test_checkbox_change_event_updates_selection_state(tmp_path):
         renderObservations();
         const checkbox = __created.find(el => el.className === 'obs-checkbox');
         if (!checkbox) throw new Error('no checkbox was rendered');
-        const before = selectionState.get(0);
+        // Selection is keyed by rowKey(), not by the row's position.
+        const key = rowKey(observations[0], null);
+        const before = selectionState.get(key);
         checkbox.checked = !before;
         checkbox.dispatch('change');
-        console.log(JSON.stringify({ before: before, after: selectionState.get(0) }));
+        console.log(JSON.stringify({ before: before, after: selectionState.get(key) }));
     """)
     result = json.loads(out)
     assert result["after"] == (not result["before"])
@@ -191,3 +193,129 @@ def test_dom_stub_supports_interaction_primitives(tmp_path):
         "attrAfterRemove": None,
         "innerHtmlThrew": True,
     }
+
+
+def test_split_expands_into_one_row_per_photo(tmp_path):
+    page = build_page(tmp_path, n_photos=4)
+    out = run_js(page, """
+        const before = displayRows().length;
+        toggleSplit(111);
+        const after = displayRows().length;
+        toggleSplit(111);
+        console.log(JSON.stringify({before, after, back: displayRows().length}));
+    """)
+    assert json.loads(out) == {"before": 1, "after": 4, "back": 1}
+
+
+def test_flag_mode_starts_split(tmp_path):
+    page = build_page(tmp_path, n_photos=4, social_split=True)
+    out = run_js(page, "console.log(displayRows().length);")
+    assert out.strip() == "4"
+
+
+def test_selection_survives_a_split_unsplit_resplit_round_trip(tmp_path):
+    page = build_page(tmp_path, n_photos=4)
+    out = run_js(page, """
+        toggleSplit(111);
+        const obs = observations[0];
+        selectionState.set(rowKey(obs, 2), false);      // drop photo C
+        toggleSplit(111);                              // unsplit
+        toggleSplit(111);                              // and back
+        console.log(JSON.stringify(displayRows().map(r => isSelected(r.obs, r.photoIndex))));
+    """)
+    assert json.loads(out) == [True, True, False, True]
+
+
+def test_deselecting_one_photo_drops_only_that_row_from_the_csv(tmp_path):
+    page = build_page(tmp_path, n_photos=4)
+    out = run_js(page, """
+        toggleSplit(111);
+        selectionState.set(rowKey(observations[0], 2), false);
+        const csv = generateCSV(getSelectedObservations());
+        const lines = csv.split('\\n');
+        const header = lines[0].split(',');
+        const idx = header.indexOf('Sighting.sightingID');
+        console.log(JSON.stringify({
+            dataRows: lines.length - 1,
+            sightingIds: [...new Set(lines.slice(1).map(l => l.split(',')[idx]))],
+            assetCols: header.filter(h => /^Encounter\\.mediaAsset\\d+$/.test(h)).length,
+            photoC: csv.includes('111_3.jpg'),
+        }));
+    """)
+    result = json.loads(out)
+    assert result["dataRows"] == 3
+    assert len(result["sightingIds"]) == 1 and result["sightingIds"][0]
+    assert result["assetCols"] == 1, "all-split export should not carry empty columns"
+    assert result["photoC"] is False, "the deselected photo leaked into the CSV"
+
+
+def test_merged_row_sighting_id_depends_on_the_flag(tmp_path):
+    for social_split, expect_id in ((False, False), (True, True)):
+        page = build_page(tmp_path / f"m{social_split}", n_photos=4, social_split=social_split)
+        out = run_js(page, """
+            observations.forEach(o => splitState.set(o.observation_id, false));
+            const csv = generateCSV(getSelectedObservations());
+            const header = csv.split('\\n')[0].split(',');
+            const idx = header.indexOf('Sighting.sightingID');
+            const value = csv.split('\\n')[1].split(',')[idx];
+            console.log(JSON.stringify({hasId: Boolean(value)}));
+        """)
+        assert json.loads(out)["hasId"] is expect_id
+
+
+def test_split_rows_stay_adjacent_after_sorting(tmp_path):
+    """Needs MORE THAN ONE observation, or it proves nothing.
+
+    Sorting ranks observations and then expands their photos. With a single
+    observation every row trivially belongs to it, so the assertion cannot fail
+    however broken the sort is. Two observations, one split and one not, with the
+    split one's first photo deselected so the sort actually has work to do, is
+    the smallest fixture that can detect scattering.
+    """
+    page = build_page(tmp_path, specs=[
+        {"id": 111, "n_photos": 3},
+        {"id": 222, "n_photos": 2},
+    ])
+    out = run_js(page, """
+        toggleSplit(111);
+        // Deselect one photo of 111 so selected-first sorting has a reason to move rows.
+        selectionState.set(rowKey(observations.find(o => o.observation_id === 111), 0), false);
+        renderObservations();
+        console.log(JSON.stringify(displayRows().map(r => r.obs.observation_id)));
+    """)
+    ids = json.loads(out)
+
+    # Every run of a given id must be contiguous: no id may reappear after a
+    # different id has intervened.
+    runs = [ids[0]]
+    for observation_id in ids[1:]:
+        if observation_id != runs[-1]:
+            runs.append(observation_id)
+    assert len(runs) == len(set(runs)), (
+        f"an observation's rows were scattered by sorting: {ids}"
+    )
+    # And the split observation really did expand, so the fixture is exercising it.
+    assert ids.count(111) == 3, ids
+    assert ids.count(222) == 1, ids
+
+
+def test_split_row_is_selected_on_its_own_licence(tmp_path):
+    """The middle photo is unlicensed: merged is all-or-nothing, split is per-photo."""
+    page = build_page(tmp_path, n_photos=3, licenses=["cc-by", "", "cc-by"])
+    out = run_js(page, """
+        const merged = isSelected(observations[0], null);
+        toggleSplit(111);
+        const split = displayRows().map(r => isSelected(r.obs, r.photoIndex));
+        console.log(JSON.stringify({merged, split}));
+    """)
+    assert json.loads(out) == {"merged": False, "split": [True, False, True]}
+
+
+def test_single_photo_observation_has_no_split_button(tmp_path):
+    page = build_page(tmp_path, n_photos=1)
+    out = run_js(page, """
+        renderObservations();
+        const labels = __created.filter(e => e.className.includes('btn-split')).map(e => e.textContent);
+        console.log(JSON.stringify(labels));
+    """)
+    assert json.loads(out) == []

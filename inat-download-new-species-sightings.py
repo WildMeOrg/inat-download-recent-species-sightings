@@ -1081,7 +1081,7 @@ class iNaturalistDownloader:
             background: #d0d0d0;
         }}
 
-        .btn-merge {{
+        .btn-split {{
             padding: 4px 12px;
             font-size: 11px;
             background: #2c7a3f;
@@ -1092,15 +1092,15 @@ class iNaturalistDownloader:
             transition: all 0.2s;
         }}
 
-        .btn-merge:hover {{
+        .btn-split:hover {{
             background: #235c31;
         }}
 
-        .btn-merge.merged {{
+        .btn-split.split {{
             background: #dc3545;
         }}
 
-        .btn-merge.merged:hover {{
+        .btn-split.split:hover {{
             background: #c82333;
         }}
 
@@ -1150,12 +1150,6 @@ class iNaturalistDownloader:
         .obs-group-even:hover,
         .obs-group-odd:hover {{
             background: #fff9e6 !important;  /* Light yellow on hover */
-        }}
-
-        /* Merged state styling */
-        .merged-row {{
-            border-left: 4px solid;  /* Border color set dynamically via JavaScript */
-            background: #fff0e6 !important;  /* Light orange background */
         }}
 
         .obs-checkbox {{
@@ -1416,7 +1410,7 @@ class iNaturalistDownloader:
                             <th>Quality</th>
                             <th>License</th>
                             <th>Photos</th>
-                            <th id="merge-header" style="display: none;">Merge</th>
+                            <th id="split-header" style="display: none;">Split</th>
                         </tr>
                     </thead>
                     <tbody id="observations-body">
@@ -1459,300 +1453,284 @@ class iNaturalistDownloader:
         // Filename components for CSV export
         const csvFilename = {csv_filename_js};
 
-        // Track which sighting_ids have been merged (sighting_id -> boolean)
-        const mergedSightings = new Map();
+        // observation_id -> bool. Seeded from initially_split (the flag plus the
+        // organism-evidence suppression), then owned by the reviewer.
+        const splitState = new Map();
 
-        // Track border colors for merged sighting groups (sighting_id -> color)
-        const mergedBorderColors = new Map();
+        function isSplit(obs) {{
+            if (!splitState.has(obs.observation_id)) {{
+                splitState.set(obs.observation_id, Boolean(obs.initially_split));
+            }}
+            return splitState.get(obs.observation_id);
+        }}
 
-        // Palette of distinct colors for merged groups
-        const mergeColors = [
-            '#ff6b35',  // Orange
-            '#d62828',  // Red
-            '#9b59b6',  // Purple
-            '#3498db',  // Blue
-            '#2ecc71',  // Green
-            '#e67e22',  // Dark orange
-            '#e91e63',  // Pink
-            '#00bcd4',  // Cyan
-            '#ff9800',  // Amber
-            '#795548',  // Brown
-            '#607d8b',  // Blue grey
-            '#f39c12'   // Yellow-orange
-        ];
+        function toggleSplit(observationId) {{
+            const obs = observations.find(o => o.observation_id === observationId);
+            if (!obs || obs.photo_count <= 1) return;
+            splitState.set(observationId, !isSplit(obs));
+            renderObservations();
+            updateStats();
+            updateCSV();
+        }}
 
-        // Whether each observation is selected for export, keyed by its index in
-        // `observations`. Seeded from the default heuristic below, then owned by
-        // the reviewer: re-rendering (after a merge toggle, say) must not throw
-        // their choices away.
+        // One display row per photo when split, otherwise one per observation.
+        function displayRows() {{
+            const rows = [];
+            observations.forEach(obs => {{
+                if (isSplit(obs)) {{
+                    // Iterate photo_count, not photos.length: photos and licenses are
+                    // padded to maxPhotos with nulls and must stay index-aligned.
+                    for (let i = 0; i < obs.photo_count; i++) rows.push({{obs: obs, photoIndex: i}});
+                }} else {{
+                    rows.push({{obs: obs, photoIndex: null}});
+                }}
+            }});
+            return rows;
+        }}
+
+        // Stable across split toggles, so a deselected photo stays deselected through a
+        // split -> unsplit -> re-split round trip. The merged row has its own key.
+        function rowKey(obs, photoIndex) {{
+            return obs.observation_id + ':' + (photoIndex === null ? 'all' : photoIndex);
+        }}
+
+        // Whether each display row is selected for export, keyed by rowKey().
+        // Seeded from the default heuristic below, then owned by the reviewer:
+        // re-rendering (after a split toggle, say) must not throw their choices away.
         const selectionState = new Map();
 
-        function defaultSelected(obs) {{
-            // Default to checked only if:
-            // 1. EVERY exported photo carries a license, AND
-            // 2. Evidence is NOT non-organism (track, scat, molt, etc.), AND
-            // 3. Observation is NOT part of "Skulls and Bones", AND
-            // 4. Quality grade is NOT "needs_id"
-            return obs.all_media_licensed &&
+        function defaultSelected(obs, photoIndex) {{
+            // A split row exports only its own photo, so it needs only that photo
+            // licensed; a merged row exports all of them and needs all licensed.
+            const licensed = photoIndex === null
+                ? obs.all_media_licensed
+                : Boolean(obs.photo_licensed && obs.photo_licensed[photoIndex]);
+            return licensed &&
                    !obs.has_non_organism_evidence &&
                    !obs.is_skulls_and_bones &&
                    obs.quality_grade !== 'needs_id';
         }}
 
-        function isSelected(index) {{
-            if (!selectionState.has(index)) {{
-                selectionState.set(index, defaultSelected(observations[index]));
+        function isSelected(obs, photoIndex) {{
+            const key = rowKey(obs, photoIndex);
+            if (!selectionState.has(key)) {{
+                selectionState.set(key, defaultSelected(obs, photoIndex));
             }}
-            return selectionState.get(index);
+            return selectionState.get(key);
         }}
-
-        // Count how many rows share each sighting_id
-        const sightingIdCounts = new Map();
-        observations.forEach(obs => {{
-            if (obs.sighting_id) {{
-                const count = sightingIdCounts.get(obs.sighting_id) || 0;
-                sightingIdCounts.set(obs.sighting_id, count + 1);
-            }}
-        }});
 
         // Initialize
         document.addEventListener('DOMContentLoaded', function() {{
-            if (socialSplitMode) {{
-                initializeMergeColumn();
-            }}
+            initializeSplitColumn();
             renderObservations();
             updateCSV();
             updateStats();
         }});
 
-        function initializeMergeColumn() {{
-            // Show the merge column header
-            const mergeHeader = document.getElementById('merge-header');
-            if (mergeHeader) {{
-                mergeHeader.style.display = '';
-            }}
-        }}
-
-        function toggleMerge(sightingId) {{
-            if (!sightingId) return;
-
-            // Toggle merge state
-            const currentState = mergedSightings.get(sightingId) || false;
-            mergedSightings.set(sightingId, !currentState);
-
-            // Assign a random color when merging (if not already assigned)
-            if (!currentState && !mergedBorderColors.has(sightingId)) {{
-                const randomColor = mergeColors[Math.floor(Math.random() * mergeColors.length)];
-                mergedBorderColors.set(sightingId, randomColor);
-            }}
-
-            // Re-render to show updated state
-            renderObservations();
-            updateCSV();
+        function initializeSplitColumn() {{
+            // Only useful when something can actually be split.
+            const header = document.getElementById('split-header');
+            if (header && maxPhotos > 1) header.style.display = '';
         }}
 
         function renderObservations() {{
             const tbody = document.getElementById('observations-body');
             tbody.innerHTML = '';
 
-            // Sort observations: selected first, then unselected
-            const sortedObservations = observations.map((obs, index) => ({{ obs, index }}))
-                .sort((a, b) => {{
-                    const aChecked = isSelected(a.index);
-                    const bChecked = isSelected(b.index);
-                    if (aChecked === bChecked) return 0;
-                    return aChecked ? -1 : 1;
-                }});
-
-            // Track observation IDs for alternating colors
-            const observationIdMap = new Map();
-            let colorIndex = 0;
-
-            sortedObservations.forEach(({{obs, index}}) => {{
-                const tr = document.createElement('tr');
-
-                // Apply alternating row colors for social split mode
-                if (socialSplitMode && obs.sighting_id) {{
-                    // Assign color group based on observation_id
-                    if (!observationIdMap.has(obs.observation_id)) {{
-                        observationIdMap.set(obs.observation_id, colorIndex % 2);
-                        colorIndex++;
-                    }}
-                    const groupClass = observationIdMap.get(obs.observation_id) === 0 ? 'obs-group-even' : 'obs-group-odd';
-                    tr.classList.add(groupClass);
-
-                    // Check if this sighting is merged
-                    if (mergedSightings.get(obs.sighting_id)) {{
-                        tr.classList.add('merged-row');
-                        // Apply the assigned border color
-                        const borderColor = mergedBorderColors.get(obs.sighting_id);
-                        if (borderColor) {{
-                            tr.style.borderLeftColor = borderColor;
-                        }}
-                    }}
-                }}
-
-                // Checkbox
-                const tdCheckbox = document.createElement('td');
-                const checkbox = document.createElement('input');
-                checkbox.type = 'checkbox';
-                checkbox.className = 'obs-checkbox';
-                checkbox.checked = isSelected(index);
-                checkbox.id = `obs-${{index}}`;
-                checkbox.addEventListener('change', () => {{
-                    selectionState.set(index, checkbox.checked);
-                    handleCheckboxChange();
-                }});
-                tdCheckbox.appendChild(checkbox);
-                tr.appendChild(tdCheckbox);
-
-                // Photo preview
-                const tdPhoto = document.createElement('td');
-                if (obs.photo_path) {{
-                    const img = document.createElement('img');
-                    img.src = obs.photo_path;
-                    img.className = 'photo-preview';
-                    img.alt = 'Observation photo';
-                    img.onclick = () => openModal(obs.all_photo_paths, 0);
-                    tdPhoto.appendChild(img);
-                }} else {{
-                    const noPhoto = document.createElement('div');
-                    noPhoto.className = 'no-photo';
-                    noPhoto.textContent = 'No photo';
-                    tdPhoto.appendChild(noPhoto);
-                }}
-                tr.appendChild(tdPhoto);
-
-                // Observation ID
-                const tdId = document.createElement('td');
-                const link = document.createElement('a');
-                link.href = obs.url;
-                link.target = '_blank';
-                link.textContent = obs.observation_id;
-                tdId.appendChild(link);
-                tr.appendChild(tdId);
-
-                // Date
-                const tdDate = document.createElement('td');
-                tdDate.textContent = obs.observed_on || 'Unknown';
-                tr.appendChild(tdDate);
-
-                // Species
-                const tdSpecies = document.createElement('td');
-                const speciesDiv = document.createElement('div');
-                const scientificName = document.createElement('div');
-                scientificName.style.fontStyle = 'italic';
-                scientificName.textContent = obs.scientific_name || 'Unknown';
-                speciesDiv.appendChild(scientificName);
-                if (obs.common_name) {{
-                    const commonName = document.createElement('div');
-                    commonName.style.fontSize = '12px';
-                    commonName.style.color = '#666';
-                    commonName.textContent = obs.common_name;
-                    speciesDiv.appendChild(commonName);
-                }}
-                tdSpecies.appendChild(speciesDiv);
-                tr.appendChild(tdSpecies);
-
-                // Location
-                const tdLocation = document.createElement('td');
-                const locationDiv = document.createElement('div');
-                if (obs.location) {{
-                    locationDiv.textContent = obs.location;
-                }}
-                tdLocation.appendChild(locationDiv);
-                tr.appendChild(tdLocation);
-
-                // GPS Status (coordinates + obscured indicator)
-                const tdGps = document.createElement('td');
-                const gpsDiv = document.createElement('div');
-
-                const hasCoords = obs.latitude !== null && obs.latitude !== undefined && obs.latitude !== ''
-                              && obs.longitude !== null && obs.longitude !== undefined && obs.longitude !== '';
-                if (hasCoords) {{
-                    // Show coordinates
-                    const coords = document.createElement('div');
-                    coords.style.fontSize = '11px';
-                    coords.style.color = '#666';
-                    coords.textContent = `${{parseFloat(obs.latitude).toFixed(4)}}, ${{parseFloat(obs.longitude).toFixed(4)}}`;
-                    gpsDiv.appendChild(coords);
-
-                    // Show obscured badge if coordinates are obscured
-                    if (obs.coordinates_obscured) {{
-                        const badge = document.createElement('span');
-                        badge.className = 'obscured-badge' + (obs.taxon_geoprivacy === 'obscured' ? ' taxon' : '');
-                        badge.textContent = obs.taxon_geoprivacy === 'obscured' ? 'TAXON' : 'OBSCURED';
-                        badge.title = obs.taxon_geoprivacy === 'obscured'
-                            ? 'Coordinates obscured due to species conservation status'
-                            : 'Coordinates obscured by observer';
-                        gpsDiv.appendChild(badge);
-
-                        // Show accuracy if available
-                        if (obs.public_positional_accuracy) {{
-                            const accuracy = document.createElement('div');
-                            accuracy.className = 'accuracy-info';
-                            const km = (obs.public_positional_accuracy / 1000).toFixed(1);
-                            accuracy.textContent = `±${{km}}km uncertainty`;
-                            gpsDiv.appendChild(accuracy);
-                        }}
-                    }} else {{
-                        // Show exact indicator
-                        const exact = document.createElement('div');
-                        exact.style.fontSize = '10px';
-                        exact.style.color = '#4caf50';
-                        exact.textContent = '✓ Exact';
-                        gpsDiv.appendChild(exact);
-                    }}
-                }} else {{
-                    gpsDiv.textContent = 'No GPS';
-                    gpsDiv.style.color = '#999';
-                }}
-
-                tdGps.appendChild(gpsDiv);
-                tr.appendChild(tdGps);
-
-                // Observer
-                const tdObserver = document.createElement('td');
-                tdObserver.textContent = obs.observer || 'Unknown';
-                tr.appendChild(tdObserver);
-
-                // Quality grade
-                const tdQuality = document.createElement('td');
-                const qualityBadge = document.createElement('span');
-                qualityBadge.className = `quality-badge quality-${{obs.quality_grade}}`;
-                qualityBadge.textContent = obs.quality_grade || 'unknown';
-                tdQuality.appendChild(qualityBadge);
-                tr.appendChild(tdQuality);
-
-                // License
-                const tdLicense = document.createElement('td');
-                tdLicense.textContent = obs.license_display || 'No license';
-                tdLicense.style.fontSize = '11px';
-                tr.appendChild(tdLicense);
-
-                // Photo count
-                const tdPhotoCount = document.createElement('td');
-                tdPhotoCount.textContent = obs.photo_count;
-                tr.appendChild(tdPhotoCount);
-
-                // Merge button (only in social split mode and only if sighting_id has multiple rows)
-                if (socialSplitMode) {{
-                    const tdMerge = document.createElement('td');
-                    // Only show merge button if this sighting_id appears in multiple rows
-                    const rowCount = sightingIdCounts.get(obs.sighting_id) || 0;
-                    if (obs.sighting_id && rowCount > 1) {{
-                        const isMerged = mergedSightings.get(obs.sighting_id) || false;
-                        const mergeBtn = document.createElement('button');
-                        mergeBtn.className = 'btn-merge' + (isMerged ? ' merged' : '');
-                        mergeBtn.textContent = isMerged ? 'Unmerge' : 'Merge';
-                        mergeBtn.onclick = () => toggleMerge(obs.sighting_id);
-                        tdMerge.appendChild(mergeBtn);
-                    }}
-                    tr.appendChild(tdMerge);
-                }}
-
-                tbody.appendChild(tr);
+            // Rank observations, not rows: expanding after sorting keeps an
+            // observation's photos adjacent instead of scattering them.
+            const ordered = observations.slice().sort((a, b) => {{
+                const aSel = anySelected(a), bSel = anySelected(b);
+                if (aSel === bSel) return 0;
+                return aSel ? -1 : 1;
             }});
+
+            let colorIndex = 0;
+            ordered.forEach(obs => {{
+                const split = isSplit(obs);
+                const groupClass = (colorIndex++ % 2 === 0) ? 'obs-group-even' : 'obs-group-odd';
+                const indices = split ? Array.from({{length: obs.photo_count}}, (_, i) => i) : [null];
+
+                indices.forEach(photoIndex => {{
+                    const tr = document.createElement('tr');
+                    if (split) tr.classList.add(groupClass);
+                    renderRow(tr, obs, photoIndex);
+                    tbody.appendChild(tr);
+                }});
+            }});
+
+            updateStats();
+        }}
+
+        function anySelected(obs) {{
+            if (isSplit(obs)) {{
+                for (let i = 0; i < obs.photo_count; i++) if (isSelected(obs, i)) return true;
+                return false;
+            }}
+            return isSelected(obs, null);
+        }}
+
+        // Builds every cell of one display row: `photoIndex` is null for a merged
+        // row (the whole observation) or the zero-based photo for a split row.
+        function renderRow(tr, obs, photoIndex) {{
+            // Checkbox
+            const tdCheckbox = document.createElement('td');
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.className = 'obs-checkbox';
+            // Keyed on the composite row key, not an array index.
+            checkbox.checked = isSelected(obs, photoIndex);
+            checkbox.id = `obs-${{rowKey(obs, photoIndex)}}`;
+            checkbox.addEventListener('change', () => {{
+                selectionState.set(rowKey(obs, photoIndex), checkbox.checked);
+                handleCheckboxChange();
+            }});
+            tdCheckbox.appendChild(checkbox);
+            tr.appendChild(tdCheckbox);
+
+            // Photo preview. A split row previews its own photo.
+            const photoPath = photoIndex === null
+                ? obs.photo_path
+                : (obs.all_photo_paths && obs.all_photo_paths[photoIndex]) || null;
+            const tdPhoto = document.createElement('td');
+            if (photoPath) {{
+                const img = document.createElement('img');
+                img.src = photoPath;
+                img.className = 'photo-preview';
+                img.alt = 'Observation photo';
+                // Open the gallery on the photo this row shows, not always the first.
+                img.onclick = () => openModal(obs.all_photo_paths, photoIndex === null ? 0 : photoIndex);
+                tdPhoto.appendChild(img);
+            }} else {{
+                const noPhoto = document.createElement('div');
+                noPhoto.className = 'no-photo';
+                noPhoto.textContent = 'No photo';
+                tdPhoto.appendChild(noPhoto);
+            }}
+            tr.appendChild(tdPhoto);
+
+            // Observation ID
+            const tdId = document.createElement('td');
+            const link = document.createElement('a');
+            link.href = obs.url;
+            link.target = '_blank';
+            link.textContent = obs.observation_id;
+            tdId.appendChild(link);
+            tr.appendChild(tdId);
+
+            // Date
+            const tdDate = document.createElement('td');
+            tdDate.textContent = obs.observed_on || 'Unknown';
+            tr.appendChild(tdDate);
+
+            // Species
+            const tdSpecies = document.createElement('td');
+            const speciesDiv = document.createElement('div');
+            const scientificName = document.createElement('div');
+            scientificName.style.fontStyle = 'italic';
+            scientificName.textContent = obs.scientific_name || 'Unknown';
+            speciesDiv.appendChild(scientificName);
+            if (obs.common_name) {{
+                const commonName = document.createElement('div');
+                commonName.style.fontSize = '12px';
+                commonName.style.color = '#666';
+                commonName.textContent = obs.common_name;
+                speciesDiv.appendChild(commonName);
+            }}
+            tdSpecies.appendChild(speciesDiv);
+            tr.appendChild(tdSpecies);
+
+            // Location
+            const tdLocation = document.createElement('td');
+            const locationDiv = document.createElement('div');
+            if (obs.location) {{
+                locationDiv.textContent = obs.location;
+            }}
+            tdLocation.appendChild(locationDiv);
+            tr.appendChild(tdLocation);
+
+            // GPS Status (coordinates + obscured indicator)
+            const tdGps = document.createElement('td');
+            const gpsDiv = document.createElement('div');
+
+            const hasCoords = obs.latitude !== null && obs.latitude !== undefined && obs.latitude !== ''
+                          && obs.longitude !== null && obs.longitude !== undefined && obs.longitude !== '';
+            if (hasCoords) {{
+                // Show coordinates
+                const coords = document.createElement('div');
+                coords.style.fontSize = '11px';
+                coords.style.color = '#666';
+                coords.textContent = `${{parseFloat(obs.latitude).toFixed(4)}}, ${{parseFloat(obs.longitude).toFixed(4)}}`;
+                gpsDiv.appendChild(coords);
+
+                // Show obscured badge if coordinates are obscured
+                if (obs.coordinates_obscured) {{
+                    const badge = document.createElement('span');
+                    badge.className = 'obscured-badge' + (obs.taxon_geoprivacy === 'obscured' ? ' taxon' : '');
+                    badge.textContent = obs.taxon_geoprivacy === 'obscured' ? 'TAXON' : 'OBSCURED';
+                    badge.title = obs.taxon_geoprivacy === 'obscured'
+                        ? 'Coordinates obscured due to species conservation status'
+                        : 'Coordinates obscured by observer';
+                    gpsDiv.appendChild(badge);
+
+                    // Show accuracy if available
+                    if (obs.public_positional_accuracy) {{
+                        const accuracy = document.createElement('div');
+                        accuracy.className = 'accuracy-info';
+                        const km = (obs.public_positional_accuracy / 1000).toFixed(1);
+                        accuracy.textContent = `±${{km}}km uncertainty`;
+                        gpsDiv.appendChild(accuracy);
+                    }}
+                }} else {{
+                    // Show exact indicator
+                    const exact = document.createElement('div');
+                    exact.style.fontSize = '10px';
+                    exact.style.color = '#4caf50';
+                    exact.textContent = '✓ Exact';
+                    gpsDiv.appendChild(exact);
+                }}
+            }} else {{
+                gpsDiv.textContent = 'No GPS';
+                gpsDiv.style.color = '#999';
+            }}
+
+            tdGps.appendChild(gpsDiv);
+            tr.appendChild(tdGps);
+
+            // Observer
+            const tdObserver = document.createElement('td');
+            tdObserver.textContent = obs.observer || 'Unknown';
+            tr.appendChild(tdObserver);
+
+            // Quality grade
+            const tdQuality = document.createElement('td');
+            const qualityBadge = document.createElement('span');
+            qualityBadge.className = `quality-badge quality-${{obs.quality_grade}}`;
+            qualityBadge.textContent = obs.quality_grade || 'unknown';
+            tdQuality.appendChild(qualityBadge);
+            tr.appendChild(tdQuality);
+
+            // License
+            const tdLicense = document.createElement('td');
+            tdLicense.textContent = obs.license_display || 'No license';
+            tdLicense.style.fontSize = '11px';
+            tr.appendChild(tdLicense);
+
+            // Photo count
+            const tdPhotoCount = document.createElement('td');
+            tdPhotoCount.textContent = photoIndex === null ? obs.photo_count : 1;
+            tr.appendChild(tdPhotoCount);
+
+            // Split / Unsplit control
+            const tdSplit = document.createElement('td');
+            if (obs.photo_count > 1) {{
+                const btn = document.createElement('button');
+                btn.className = 'btn-split' + (isSplit(obs) ? ' split' : '');
+                btn.textContent = isSplit(obs) ? 'Unsplit' : 'Split';
+                btn.onclick = () => toggleSplit(obs.observation_id);
+                tdSplit.appendChild(btn);
+            }}
+            tr.appendChild(tdSplit);
         }}
 
         function handleCheckboxChange() {{
@@ -1761,26 +1739,21 @@ class iNaturalistDownloader:
         }}
 
         function updateStats() {{
-            const total = observations.length;
-            const selected = getSelectedObservations().length;
-            const obscured = observations.filter(obs => obs.coordinates_obscured).length;
-
-            document.getElementById('total-count').textContent = total;
-            document.getElementById('selected-count').textContent = selected;
-            document.getElementById('obscured-count').textContent = obscured;
+            const rows = displayRows();
+            document.getElementById('total-count').textContent = rows.length;
+            document.getElementById('selected-count').textContent =
+                rows.filter(r => isSelected(r.obs, r.photoIndex)).length;
+            document.getElementById('obscured-count').textContent =
+                observations.filter(obs => obs.coordinates_obscured).length;
         }}
 
         function getSelectedObservations() {{
-            return observations.filter((obs, index) => isSelected(index));
+            return displayRows().filter(r => isSelected(r.obs, r.photoIndex));
         }}
 
         function setAllSelected(value) {{
-            observations.forEach((obs, index) => selectionState.set(index, value));
-            observations.forEach((obs, index) => {{
-                const checkbox = document.getElementById(`obs-${{index}}`);
-                if (checkbox) checkbox.checked = value;
-            }});
-            updateStats();
+            displayRows().forEach(r => selectionState.set(rowKey(r.obs, r.photoIndex), value));
+            renderObservations();
             updateCSV();
         }}
 
@@ -1798,65 +1771,17 @@ class iNaturalistDownloader:
             document.getElementById('csv-output').textContent = csv;
         }}
 
-        function generateCSV(data) {{
-            if (data.length === 0) {{
+        // Takes display rows -- {{obs, photoIndex}} pairs from displayRows() -- so
+        // there is nothing to regroup here: a split observation already arrives as
+        // one row per photo.
+        function generateCSV(rows) {{
+            if (rows.length === 0) {{
                 return 'No observations selected';
             }}
 
-            // Process data: merge rows if their sighting_id is marked as merged
-            let processedData = [];
-
-            if (socialSplitMode) {{
-                // Group observations by sighting_id
-                const sightingGroups = new Map();
-
-                data.forEach(obs => {{
-                    const sightingId = obs.sighting_id;
-
-                    // If this sighting is merged, group all rows together
-                    if (sightingId && mergedSightings.get(sightingId)) {{
-                        if (!sightingGroups.has(sightingId)) {{
-                            sightingGroups.set(sightingId, []);
-                        }}
-                        sightingGroups.get(sightingId).push(obs);
-                    }} else {{
-                        // Not merged, add as individual row
-                        processedData.push(obs);
-                    }}
-                }});
-
-                // Merge grouped observations into single rows
-                sightingGroups.forEach((obsGroup, sightingId) => {{
-                    if (obsGroup.length === 0) return;
-
-                    // Use first observation as base
-                    const mergedObs = {{ ...obsGroup[0] }};
-
-                    // Collect all photos and licenses from all observations in the group
-                    const allPhotos = [];
-                    const allLicenses = [];
-
-                    obsGroup.forEach(obs => {{
-                        obs.photos.forEach((photo, idx) => {{
-                            if (photo) {{
-                                allPhotos.push(photo);
-                                allLicenses.push(obs.licenses[idx] || '');
-                            }}
-                        }});
-                    }});
-
-                    // Update merged observation with combined photos
-                    mergedObs.photos = allPhotos;
-                    mergedObs.licenses = allLicenses;
-                    mergedObs.photo_count = allPhotos.length;
-                    mergedObs.photo_filenames = allPhotos.join('; ');
-
-                    processedData.push(mergedObs);
-                }});
-            }} else {{
-                // Not in social split mode, use data as-is
-                processedData = data;
-            }}
+            // Sized before the header is built, so the mediaAsset columns match
+            // the rows actually written.
+            const columnCount = csvColumnCount(rows);
 
             // Build header
             const headers = [
@@ -1888,20 +1813,30 @@ class iNaturalistDownloader:
                 'photo_filenames'
             ];
 
-            // Add photo asset columns. Sized from the rows being written, not
-            // from the export-time maximum: merging split rows back together
-            // recombines more photos than any single row ever carried, and
-            // anything past the last column would be dropped silently.
-            const columnCount = csvColumnCount(processedData);
+            // Add photo asset columns.
             for (let i = 0; i < columnCount; i++) {{
                 headers.push(`Encounter.mediaAsset${{i}}`);
                 headers.push(`Encounter.mediaAsset${{i}}.license`);
             }}
 
-            const rows = [headers.join(',')];
+            const lines = [headers.join(',')];
 
             // Add data rows
-            processedData.forEach(obs => {{
+            rows.forEach(({{obs, photoIndex}}) => {{
+                // A split row carries only its own photo; a merged row carries the
+                // observation's real photos, without the null padding to maxPhotos.
+                const photos = photoIndex === null
+                    ? obs.photos.slice(0, obs.photo_count)
+                    : [obs.photos[photoIndex]];
+                const licenses = photoIndex === null
+                    ? obs.licenses.slice(0, obs.photo_count)
+                    : [obs.licenses[photoIndex]];
+
+                // Mode-dependent BY DESIGN -- see the spec, decision 4. With the flag,
+                // every row keeps a sighting ID so existing Wildbook imports are
+                // unchanged, even a lone row. Do not "simplify" this to isSplit alone.
+                const sightingId = (socialSplitMode || isSplit(obs)) ? obs.sighting_id : '';
+
                 const row = [
                     escapeCSV(obs.observation_id),
                     escapeCSV(obs.observed_on),
@@ -1921,30 +1856,34 @@ class iNaturalistDownloader:
                     escapeCSV('unapproved'),  // Encounter.state - always unapproved
                     escapeCSV(obs.project_name),
                     escapeCSV(obs.project_owner),
-                    escapeCSV(obs.sighting_id),
+                    escapeCSV(sightingId),
                     escapeCSV(obs.observer),
                     escapeCSV(obs.quality_grade),
                     escapeCSV(obs.url),
                     escapeCSV(obs.other_catalog_numbers),
                     escapeCSV(obs.researcher_comments),
-                    escapeCSV(obs.photo_count),
-                    escapeCSV(obs.photo_filenames)
+                    escapeCSV(photos.length),
+                    escapeCSV(photos.join('; '))
                 ];
 
                 // Add photo assets and licenses
                 for (let i = 0; i < columnCount; i++) {{
-                    row.push(escapeCSV(obs.photos[i]));
-                    row.push(escapeCSV(obs.licenses[i]));
+                    row.push(escapeCSV(photos[i]));
+                    row.push(escapeCSV(licenses[i]));
                 }}
 
-                rows.push(row.join(','));
+                lines.push(row.join(','));
             }});
 
-            return rows.join('\\n');
+            return lines.join('\\n');
         }}
 
         function csvColumnCount(rows) {{
-            return rows.reduce((n, obs) => Math.max(n, obs.photos.length), maxPhotos);
+            // Sized from the rows actually written: an all-split export must not carry
+            // empty mediaAsset columns, and a merged one must fit its widest row.
+            return Math.max(1, ...rows.map(
+                r => r.photoIndex === null ? r.obs.photo_count : 1
+            ));
         }}
 
         function escapeCSV(value) {{

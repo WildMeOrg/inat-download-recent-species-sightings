@@ -150,24 +150,6 @@ def test_html_survives_script_tag_in_inaturalist_text():
         )
 
 
-def test_merged_export_column_count_covers_recombined_photos():
-    """Merging split rows back together must keep a column for every photo."""
-    with tempfile.TemporaryDirectory() as tmp:
-        d = _downloader(tmp, social_split=True)
-        rows = d.process_observations([_obs(n_photos=4)], "Panthera onca")
-        for i in range(1, 5):
-            (Path(tmp) / "photos" / f"111_{i}.jpg").write_bytes(b"x")
-        d.write_html(rows, "review.html")
-        html = (Path(tmp) / "review.html").read_text(encoding="utf-8")
-
-        # The browser-side CSV builder must size its mediaAsset columns from the
-        # merged photo count, not from the per-row maximum baked in at export.
-        assert "function csvColumnCount" in html, (
-            "generateCSV still uses the static maxPhotos for its column count, "
-            "so merging 4 split rows would drop 3 photos"
-        )
-
-
 def test_both_export_paths_emit_the_same_columns():
     """The CSV and HTML exports must not drift apart.
 
