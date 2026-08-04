@@ -14,6 +14,8 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any
+import shutil
+import urllib.error
 import urllib.request
 import urllib.parse
 import json
@@ -21,12 +23,66 @@ import time
 import uuid
 
 
+# Without an explicit timeout urllib blocks forever on a server that accepts the
+# connection and then goes quiet.
+HTTP_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = 120
+MAX_RETRIES = 3
+
+
+def fetch_json(url: str, rate_limit: float = 1.0, timeout: int = HTTP_TIMEOUT,
+               max_retries: int = MAX_RETRIES) -> Dict[str, Any]:
+    """
+    GET a JSON document, retrying transient failures with exponential backoff.
+
+    Args:
+        url: Fully-formed request URL
+        rate_limit: Seconds to pause after a successful request
+        timeout: Per-request socket timeout in seconds
+        max_retries: Total attempts before giving up
+
+    Returns:
+        The decoded JSON body
+
+    Raises:
+        RuntimeError: If every attempt failed
+    """
+    last_error = None
+    attempts = 0
+
+    for attempt in range(1, max_retries + 1):
+        attempts = attempt
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                payload = json.loads(response.read().decode())
+            time.sleep(rate_limit)
+            return payload
+        except urllib.error.HTTPError as e:
+            last_error = e
+            # 4xx other than rate-limiting will not improve on retry.
+            if e.code != 429 and e.code < 500:
+                break
+        except Exception as e:
+            last_error = e
+
+        if attempt < max_retries:
+            backoff = rate_limit * (2 ** attempt)
+            print(f"    Request failed ({last_error}); retrying in {backoff:.1f}s "
+                  f"(attempt {attempt + 1}/{max_retries})")
+            time.sleep(backoff)
+
+    plural = '' if attempts == 1 else 's'
+    raise RuntimeError(
+        f"Request failed after {attempts} attempt{plural}: {url} ({last_error})"
+    )
+
+
 class iNaturalistDownloader:
     """Downloads observations and photos from iNaturalist API."""
 
     BASE_URL = "https://api.inaturalist.org/v1"
 
-    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None, social_split: bool = False, clip_filter: str = None, project_owner: str = None):
+    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None, social_split: bool = False, project_owner: str = None):
         """
         Initialize the downloader.
 
@@ -40,7 +96,6 @@ class iNaturalistDownloader:
             location_id: Optional location ID to add to all observations in Encounter.locationID column
             submitter_id: Optional submitter ID to add to all observations in Encounter.submitterID column
             social_split: Split multi-photo observations into separate rows with shared sighting ID (default: False)
-            clip_filter: Optional CLIP text prompts to filter out images (comma-separated, e.g., "footprint,track,paw print")
             project_owner: Optional Wildbook username to own the project (required for new projects)
         """
         self.output_dir = Path(output_dir)
@@ -53,17 +108,16 @@ class iNaturalistDownloader:
         self.location_id = location_id
         self.submitter_id = submitter_id
         self.social_split = social_split
-        self.clip_filter = clip_filter
         self.project_owner = project_owner
         self.photos_dir = self.output_dir / "photos"
-
-        # CLIP model (lazy-loaded when needed)
-        self.clip_model = None
-        self.clip_processor = None
 
         # Create directories if they don't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.photos_dir.mkdir(parents=True, exist_ok=True)
+
+    def _get_json(self, url: str) -> Dict[str, Any]:
+        """GET a JSON document using this downloader's rate limit."""
+        return fetch_json(url, rate_limit=self.rate_limit)
 
     def get_date_range(self) -> tuple:
         """Calculate the date range for the search."""
@@ -109,11 +163,7 @@ class iNaturalistDownloader:
         url = f"{self.BASE_URL}/taxa?{params}"
 
         try:
-            with urllib.request.urlopen(url) as response:
-                data = json.loads(response.read().decode())
-
-            # Rate limiting
-            time.sleep(self.rate_limit)
+            data = self._get_json(url)
 
             if data['results']:
                 taxon = data['results'][0]
@@ -145,11 +195,7 @@ class iNaturalistDownloader:
         url = f"{self.BASE_URL}/places/autocomplete?{params}"
 
         try:
-            with urllib.request.urlopen(url) as response:
-                data = json.loads(response.read().decode())
-
-            # Rate limiting
-            time.sleep(self.rate_limit)
+            data = self._get_json(url)
 
             places = data.get('results', [])
 
@@ -226,116 +272,25 @@ class iNaturalistDownloader:
 
             url = f"{self.BASE_URL}/observations?{params}"
 
-            try:
-                with urllib.request.urlopen(url) as response:
-                    data = json.loads(response.read().decode())
+            data = self._get_json(url)
 
-                # Rate limiting
-                time.sleep(self.rate_limit)
+            results = data.get('results', [])
 
-                results = data.get('results', [])
-
-                if not results:
-                    break
-
-                all_observations.extend(results)
-                print(f"    Page {page}: {len(results)} observations")
-
-                # Check if there are more pages
-                total_results = data.get('total_results', 0)
-                if len(all_observations) >= total_results:
-                    break
-
-                page += 1
-
-            except Exception as e:
-                print(f"    Error fetching observations (page {page}): {e}")
+            if not results:
                 break
+
+            all_observations.extend(results)
+            print(f"    Page {page}: {len(results)} observations")
+
+            # Check if there are more pages
+            total_results = data.get('total_results', 0)
+            if len(all_observations) >= total_results:
+                break
+
+            page += 1
 
         print(f"  Total observations found: {len(all_observations)}")
         return all_observations
-
-    def load_clip_model(self):
-        """Load CLIP model for image analysis (lazy loading)."""
-        if self.clip_model is not None:
-            return  # Already loaded
-
-        try:
-            from PIL import Image
-            import torch
-            from transformers import CLIPProcessor, CLIPModel
-
-            print("Loading CLIP model for image analysis...")
-            self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-            self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-            print("  CLIP model loaded successfully")
-        except ImportError:
-            print("\nError: CLIP filtering requires additional packages.")
-            print("Please install them with: pip install transformers torch pillow")
-            sys.exit(1)
-        except Exception as e:
-            print(f"\nError loading CLIP model: {e}")
-            sys.exit(1)
-
-    def analyze_image_with_clip(self, image_path: str, filter_terms: List[str]) -> bool:
-        """
-        Analyze an image using CLIP to determine if it matches any filter terms.
-
-        Args:
-            image_path: Path to the image file
-            filter_terms: List of text descriptions to check against (e.g., ["footprint", "track"])
-
-        Returns:
-            True if image matches any filter term (should be filtered out), False otherwise
-        """
-        if not self.clip_model:
-            self.load_clip_model()
-
-        try:
-            from PIL import Image
-            import torch
-
-            # Load and process image
-            image = Image.open(image_path).convert('RGB')
-
-            # Create text prompts - add positive prompt for the actual organism
-            negative_prompts = filter_terms  # e.g., ["footprint", "track", "paw print"]
-            positive_prompt = ["a photograph of a live animal", "a photograph of a living organism"]
-            all_prompts = positive_prompt + negative_prompts
-
-            # Process inputs
-            inputs = self.clip_processor(
-                text=all_prompts,
-                images=image,
-                return_tensors="pt",
-                padding=True
-            )
-
-            # Get predictions
-            with torch.no_grad():
-                outputs = self.clip_model(**inputs)
-                logits_per_image = outputs.logits_per_image
-                probs = logits_per_image.softmax(dim=1)[0]
-
-            # Check if any negative prompt has high probability
-            # We use indices 2+ for negative prompts (first 2 are positive)
-            negative_probs = probs[len(positive_prompt):]
-            max_negative_prob = negative_probs.max().item()
-
-            # If any filter term has >40% probability, mark for filtering
-            # Adjust threshold as needed (higher = more strict)
-            threshold = 0.40
-
-            if max_negative_prob > threshold:
-                max_idx = negative_probs.argmax().item()
-                matched_term = filter_terms[max_idx]
-                return True, matched_term, max_negative_prob
-
-            return False, None, 0.0
-
-        except Exception as e:
-            print(f"      Warning: Error analyzing image {image_path} with CLIP: {e}")
-            return False, None, 0.0
 
     def download_photo(self, url: str, filename: str) -> bool:
         """
@@ -354,11 +309,18 @@ class iNaturalistDownloader:
         if filepath.exists():
             return True
 
+        # Download to a sibling .part file and rename on success, so an
+        # interrupted transfer is not cached as a complete photo.
+        partial = filepath.with_name(filepath.name + '.part')
         try:
-            urllib.request.urlretrieve(url, filepath)
+            with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response, \
+                    open(partial, 'wb') as out:
+                shutil.copyfileobj(response, out)
+            partial.replace(filepath)
             return True
         except Exception as e:
             print(f"      Error downloading photo {filename}: {e}")
+            partial.unlink(missing_ok=True)
             return False
 
     def extract_gif_frames(self, gif_path: Path) -> List[str]:
@@ -521,7 +483,12 @@ class iNaturalistDownloader:
 
             # Parse annotations for living status and evidence of presence
             living_status = 'alive'  # Default to 'alive'
-            is_single_subject = False  # Track if observation has "single subject" annotation
+            # iNaturalist "Evidence of Presence" == "Organism". NOTE: this says
+            # the evidence is the animal itself, NOT that only one individual is
+            # pictured; iNaturalist has no single-subject annotation. Splitting
+            # is currently suppressed for these, which is almost certainly too
+            # broad -- see README for the open question.
+            has_organism_evidence = False
             has_non_organism_evidence = False  # Track if evidence is something other than organism
             annotations = obs.get('annotations')
             if annotations and isinstance(annotations, list):
@@ -538,9 +505,9 @@ class iNaturalistDownloader:
 
                         # Evidence of Presence annotations (controlled_attribute_id == 22)
                         if controlled_attribute_id == 22:
-                            # controlled_value_id 24 = "Organism" (single subject - good)
+                            # controlled_value_id 24 = "Organism"
                             if controlled_value_id == 24:
-                                is_single_subject = True
+                                has_organism_evidence = True
                             # Any other value (track, scat, molt, etc.) should be deselected
                             elif controlled_value_id is not None:
                                 has_non_organism_evidence = True
@@ -607,8 +574,7 @@ class iNaturalistDownloader:
             project_name = self.generate_project_name(encounter_genus, encounter_specific_epithet)
 
             # If social_split is enabled and there are multiple photos, create one row per photo
-            # BUT only if the observation is NOT marked as single subject
-            if self.social_split and len(photo_filenames) > 1 and not is_single_subject:
+            if self.social_split and len(photo_filenames) > 1 and not has_organism_evidence:
                 # Generate a common sighting ID for all photos from this observation
                 sighting_id = str(uuid.uuid4())
 
@@ -696,6 +662,28 @@ class iNaturalistDownloader:
 
         return processed_data
 
+    def deduplicate_rows(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Drop rows that describe the same observation *and* the same media.
+
+        Several species names can resolve to one taxon, so the same observation
+        can be processed more than once. Keying on observation_id alone is not
+        enough: with --social-split-observations one observation legitimately
+        produces several rows, distinguished only by which photo they carry.
+
+        Args:
+            data: Processed observation rows
+
+        Returns:
+            The rows in their original order, with true duplicates removed
+        """
+        unique_rows = {}
+        for row in data:
+            key = (row.get('observation_id'), tuple(row.get('_photo_list', [])))
+            if key not in unique_rows:
+                unique_rows[key] = row
+        return list(unique_rows.values())
+
     def write_csv(self, data: List[Dict[str, Any]], filename: str):
         """
         Write observation data to CSV file.
@@ -717,24 +705,22 @@ class iNaturalistDownloader:
             if len(photo_list) > max_photos:
                 max_photos = len(photo_list)
 
-        # Add individual photo columns and license columns to each row
+        # Build the export rows as copies. Callers may export the same data
+        # more than once (CSV then HTML), so the input rows keep their
+        # underscore-prefixed internal fields.
+        export_rows = []
         for row in data:
             photo_list = row.get('_photo_list', [])
             license_list = row.get('_license_list', [])
+            export_row = {k: v for k, v in row.items() if not k.startswith('_')}
             for i in range(max_photos):
-                # Add photo filename column
-                photo_column_name = f'Encounter.mediaAsset{i}'
-                row[photo_column_name] = photo_list[i] if i < len(photo_list) else None
-                # Add license column
-                license_column_name = f'Encounter.mediaAsset{i}.license'
-                row[license_column_name] = license_list[i] if i < len(license_list) else None
-            # Remove temporary fields
-            del row['_photo_list']
-            del row['_license_list']
-            row.pop('_coordinates_obscured', None)
-            row.pop('_geoprivacy', None)
-            row.pop('_taxon_geoprivacy', None)
-            row.pop('_public_positional_accuracy', None)
+                export_row[f'Encounter.mediaAsset{i}'] = (
+                    photo_list[i] if i < len(photo_list) else None
+                )
+                export_row[f'Encounter.mediaAsset{i}.license'] = (
+                    license_list[i] if i < len(license_list) else None
+                )
+            export_rows.append(export_row)
 
         # Build fieldnames with dynamic photo columns
         fieldnames = [
@@ -763,9 +749,7 @@ class iNaturalistDownloader:
             'Encounter.otherCatalogNumbers',
             'Encounter.researcherComments',
             'photo_count',
-            'photo_filenames',
-            '_has_non_organism_evidence',
-            '_is_skulls_and_bones'
+            'photo_filenames'
         ]
 
         # Add photo asset columns and license columns
@@ -776,7 +760,7 @@ class iNaturalistDownloader:
         with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(data)
+            writer.writerows(export_rows)
 
         print(f"\nCSV file written: {csv_path}")
         print(f"Total observations: {len(data)}")
@@ -829,6 +813,14 @@ class iNaturalistDownloader:
             unique_licenses = list(set([lic for lic in license_list if lic]))
             license_display = ', '.join(unique_licenses) if unique_licenses else 'No license'
 
+            # Only default-select a row when *every* photo it would export
+            # carries a license. One licensed photo used to be enough, which
+            # quietly shipped all-rights-reserved media alongside it.
+            all_media_licensed = bool(photo_list) and all(
+                license_list[i] if i < len(license_list) else None
+                for i in range(len(photo_list))
+            )
+
             # Build observation object
             obs_data = {
                 'observation_id': row.get('observation_id'),
@@ -857,6 +849,7 @@ class iNaturalistDownloader:
                 'photo_count': len(photo_list),
                 'photo_filenames': '; '.join(photo_list),
                 'license_display': license_display,
+                'all_media_licensed': all_media_licensed,
                 'has_non_organism_evidence': row.get('_has_non_organism_evidence', False),
                 'is_skulls_and_bones': row.get('_is_skulls_and_bones', False),
                 'coordinates_obscured': row.get('_coordinates_obscured', False),
@@ -888,14 +881,37 @@ class iNaturalistDownloader:
         print(f"Open this file in your web browser to review and select observations.")
         print(f"Maximum photos per observation: {max_photos}")
 
+    @staticmethod
+    def _json_for_script_block(payload: Any) -> str:
+        """
+        Serialize to JSON that is safe to inline inside a <script> element.
+
+        iNaturalist free text (place_guess, common names, user logins) reaches
+        this page verbatim. An unescaped "</script>" would close the block
+        early, breaking the page and executing whatever followed.
+        """
+        # ensure_ascii=True also escapes U+2028/U+2029, which are legal in
+        # JSON but are line terminators to a JavaScript parser.
+        return (
+            json.dumps(payload, indent=2, ensure_ascii=True)
+            .replace('<', '\\u003c')
+            .replace('>', '\\u003e')
+            .replace('&', '\\u0026')
+        )
+
     def _generate_html_template(self, observations: List[Dict], max_photos: int, social_split: bool) -> str:
         """Generate the HTML template with embedded JavaScript."""
-        observations_json_str = json.dumps(observations, indent=2)
+        observations_json_str = self._json_for_script_block(observations)
 
-        # Build filename components for CSV download
+        # Build the CSV download filename. Species names come from the command
+        # line and can contain apostrophes ("Cooper's hawk"), which would break
+        # out of a raw JS string literal, so emit it as JSON.
         species_part = "_".join([s.replace(" ", "-") for s in self.species_list[:2]])
         place_part = f"_{self.place.replace(' ', '-')}" if self.place else ""
         date_part = datetime.now().strftime("%Y%m%d")
+        csv_filename_js = self._json_for_script_block(
+            f"inat_observations_export_{species_part}{place_part}_{date_part}.csv"
+        )
         social_split_js = 'true' if social_split else 'false'
 
         return f'''<!DOCTYPE html>
@@ -1413,7 +1429,7 @@ class iNaturalistDownloader:
         const socialSplitMode = {social_split_js};
 
         // Filename components for CSV export
-        const csvFilename = 'inat_observations_export_{species_part}{place_part}_{date_part}.csv';
+        const csvFilename = {csv_filename_js};
 
         // Track which sighting_ids have been merged (sighting_id -> boolean)
         const mergedSightings = new Map();
@@ -1436,6 +1452,31 @@ class iNaturalistDownloader:
             '#607d8b',  // Blue grey
             '#f39c12'   // Yellow-orange
         ];
+
+        // Whether each observation is selected for export, keyed by its index in
+        // `observations`. Seeded from the default heuristic below, then owned by
+        // the reviewer: re-rendering (after a merge toggle, say) must not throw
+        // their choices away.
+        const selectionState = new Map();
+
+        function defaultSelected(obs) {{
+            // Default to checked only if:
+            // 1. EVERY exported photo carries a license, AND
+            // 2. Evidence is NOT non-organism (track, scat, molt, etc.), AND
+            // 3. Observation is NOT part of "Skulls and Bones", AND
+            // 4. Quality grade is NOT "needs_id"
+            return obs.all_media_licensed &&
+                   !obs.has_non_organism_evidence &&
+                   !obs.is_skulls_and_bones &&
+                   obs.quality_grade !== 'needs_id';
+        }}
+
+        function isSelected(index) {{
+            if (!selectionState.has(index)) {{
+                selectionState.set(index, defaultSelected(observations[index]));
+            }}
+            return selectionState.get(index);
+        }}
 
         // Count how many rows share each sighting_id
         const sightingIdCounts = new Map();
@@ -1486,19 +1527,11 @@ class iNaturalistDownloader:
             const tbody = document.getElementById('observations-body');
             tbody.innerHTML = '';
 
-            // Sort observations: checked (selected) first, then unchecked
+            // Sort observations: selected first, then unselected
             const sortedObservations = observations.map((obs, index) => ({{ obs, index }}))
                 .sort((a, b) => {{
-                    const aChecked = a.obs.license_display !== 'No license' &&
-                                     !a.obs.has_non_organism_evidence &&
-                                     !a.obs.is_skulls_and_bones &&
-                                     a.obs.quality_grade !== 'needs_id';
-                    const bChecked = b.obs.license_display !== 'No license' &&
-                                     !b.obs.has_non_organism_evidence &&
-                                     !b.obs.is_skulls_and_bones &&
-                                     b.obs.quality_grade !== 'needs_id';
-
-                    // Checked items (true) should come first
+                    const aChecked = isSelected(a.index);
+                    const bChecked = isSelected(b.index);
                     if (aChecked === bChecked) return 0;
                     return aChecked ? -1 : 1;
                 }});
@@ -1536,17 +1569,12 @@ class iNaturalistDownloader:
                 const checkbox = document.createElement('input');
                 checkbox.type = 'checkbox';
                 checkbox.className = 'obs-checkbox';
-                // Default to checked only if:
-                // 1. Observation has a license, AND
-                // 2. Evidence is NOT non-organism (track, scat, molt, etc.), AND
-                // 3. Observation is NOT part of "Skulls and Bones" project, AND
-                // 4. Quality grade is NOT "needs_id"
-                checkbox.checked = obs.license_display !== 'No license' &&
-                                   !obs.has_non_organism_evidence &&
-                                   !obs.is_skulls_and_bones &&
-                                   obs.quality_grade !== 'needs_id';
+                checkbox.checked = isSelected(index);
                 checkbox.id = `obs-${{index}}`;
-                checkbox.addEventListener('change', handleCheckboxChange);
+                checkbox.addEventListener('change', () => {{
+                    selectionState.set(index, checkbox.checked);
+                    handleCheckboxChange();
+                }});
                 tdCheckbox.appendChild(checkbox);
                 tr.appendChild(tdCheckbox);
 
@@ -1611,7 +1639,9 @@ class iNaturalistDownloader:
                 const tdGps = document.createElement('td');
                 const gpsDiv = document.createElement('div');
 
-                if (obs.latitude && obs.longitude) {{
+                const hasCoords = obs.latitude !== null && obs.latitude !== undefined && obs.latitude !== ''
+                              && obs.longitude !== null && obs.longitude !== undefined && obs.longitude !== '';
+                if (hasCoords) {{
                     // Show coordinates
                     const coords = document.createElement('div');
                     coords.style.fontSize = '11px';
@@ -1713,32 +1743,25 @@ class iNaturalistDownloader:
         }}
 
         function getSelectedObservations() {{
-            const selected = [];
+            return observations.filter((obs, index) => isSelected(index));
+        }}
+
+        function setAllSelected(value) {{
+            observations.forEach((obs, index) => selectionState.set(index, value));
             observations.forEach((obs, index) => {{
                 const checkbox = document.getElementById(`obs-${{index}}`);
-                if (checkbox && checkbox.checked) {{
-                    selected.push(obs);
-                }}
+                if (checkbox) checkbox.checked = value;
             }});
-            return selected;
+            updateStats();
+            updateCSV();
         }}
 
         function selectAll() {{
-            observations.forEach((obs, index) => {{
-                const checkbox = document.getElementById(`obs-${{index}}`);
-                if (checkbox) checkbox.checked = true;
-            }});
-            updateStats();
-            updateCSV();
+            setAllSelected(true);
         }}
 
         function deselectAll() {{
-            observations.forEach((obs, index) => {{
-                const checkbox = document.getElementById(`obs-${{index}}`);
-                if (checkbox) checkbox.checked = false;
-            }});
-            updateStats();
-            updateCSV();
+            setAllSelected(false);
         }}
 
         function updateCSV() {{
@@ -1837,8 +1860,12 @@ class iNaturalistDownloader:
                 'photo_filenames'
             ];
 
-            // Add photo asset columns
-            for (let i = 0; i < maxPhotos; i++) {{
+            // Add photo asset columns. Sized from the rows being written, not
+            // from the export-time maximum: merging split rows back together
+            // recombines more photos than any single row ever carried, and
+            // anything past the last column would be dropped silently.
+            const columnCount = csvColumnCount(processedData);
+            for (let i = 0; i < columnCount; i++) {{
                 headers.push(`Encounter.mediaAsset${{i}}`);
                 headers.push(`Encounter.mediaAsset${{i}}.license`);
             }}
@@ -1877,7 +1904,7 @@ class iNaturalistDownloader:
                 ];
 
                 // Add photo assets and licenses
-                for (let i = 0; i < maxPhotos; i++) {{
+                for (let i = 0; i < columnCount; i++) {{
                     row.push(escapeCSV(obs.photos[i]));
                     row.push(escapeCSV(obs.licenses[i]));
                 }}
@@ -1888,12 +1915,21 @@ class iNaturalistDownloader:
             return rows.join('\\n');
         }}
 
+        function csvColumnCount(rows) {{
+            return rows.reduce((n, obs) => Math.max(n, obs.photos.length), maxPhotos);
+        }}
+
         function escapeCSV(value) {{
             if (value === null || value === undefined) {{
                 return '';
             }}
-            const str = String(value);
-            if (str.includes(',') || str.includes('"') || str.includes('\\n')) {{
+            let str = String(value);
+            // Neutralise spreadsheet formula injection from iNaturalist free
+            // text, but leave genuine negative numbers (latitudes) alone.
+            if (/^[=+\\-@\\t\\r]/.test(str) && !/^-?\\d*\\.?\\d+$/.test(str)) {{
+                str = "'" + str;
+            }}
+            if (/[",\\r\\n]/.test(str)) {{
                 return '"' + str.replace(/"/g, '""') + '"';
             }}
             return str;
@@ -2103,21 +2139,11 @@ class iNaturalistDownloader:
             processed_data = self.process_observations(observations, species_name)
             all_observations_data.extend(processed_data)
 
-        # Deduplicate observations by observation_id
-        # (Multiple species names may resolve to the same taxon, causing duplicates)
         if all_observations_data:
             print(f"\nDeduplicating observations...")
-            print(f"  Total observations before deduplication: {len(all_observations_data)}")
-
-            # Use a dict to deduplicate by observation_id, keeping first occurrence
-            unique_obs = {}
-            for obs in all_observations_data:
-                obs_id = obs.get('observation_id')
-                if obs_id not in unique_obs:
-                    unique_obs[obs_id] = obs
-
-            all_observations_data = list(unique_obs.values())
-            print(f"  Unique observations after deduplication: {len(all_observations_data)}")
+            print(f"  Total rows before deduplication: {len(all_observations_data)}")
+            all_observations_data = self.deduplicate_rows(all_observations_data)
+            print(f"  Unique rows after deduplication: {len(all_observations_data)}")
 
         # Write to CSV or HTML
         if all_observations_data:
