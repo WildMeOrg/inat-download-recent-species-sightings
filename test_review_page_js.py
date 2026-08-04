@@ -519,6 +519,96 @@ def test_splitting_the_narrower_observation_uses_its_own_photo_count(tmp_path):
     assert result["csvRowsFor222"] == 2, "phantom rows reached the CSV"
 
 
+def test_no_selection_keys_are_seeded_beyond_a_photo_count(tmp_path):
+    """State hygiene for the same padding invariant, one layer deeper.
+
+    anySelected() probes each photo of a split observation to rank it. Driving
+    that probe from photos.length instead of photo_count returns the same answer
+    today -- the padded photo_licensed entries are False, so the extra probes are
+    always false -- but isSelected() *seeds* a key for every index it is asked
+    about, leaving phantom entries like "222:2" on a 2-photo observation. They
+    are inert only because nothing currently reads past photo_count; the moment
+    anything does (the exact mutation family this suite keeps catching) those
+    pre-seeded False keys would silently deselect real split rows instead of
+    letting them default to their own licence.
+
+    The probe short-circuits on the first selected photo, so 222's real photos
+    are deselected here to force anySelected all the way through.
+    """
+    page = build_page(tmp_path, specs=[
+        {"id": 111, "n_photos": 4},
+        {"id": 222, "n_photos": 2},
+    ])
+    out = run_js(page, """
+        const obs222 = observations.find(o => o.observation_id === 222);
+        toggleSplit(222);
+        for (let i = 0; i < obs222.photo_count; i++) {
+            selectionState.set(rowKey(obs222, i), false);
+        }
+        renderObservations();   // sorts, so anySelected() probes every photo
+        const limits = new Map(observations.map(o => [String(o.observation_id), o.photo_count]));
+        console.log(JSON.stringify({
+            phantom: [...selectionState.keys()].filter(k => {
+                const parts = k.split(':');
+                return parts[1] !== 'all' && Number(parts[1]) >= limits.get(parts[0]);
+            }),
+            paddedWidth: obs222.photos.length,
+            realWidth: obs222.photo_count,
+        }));
+    """)
+    result = json.loads(out)
+    assert result["paddedWidth"] > result["realWidth"], "the fixture must actually pad"
+    assert result["phantom"] == [], (
+        f"selection keys were seeded past photo_count: {result['phantom']}"
+    )
+
+
+def test_export_columns_are_sized_by_the_widest_row_written(tmp_path):
+    """Splits the WIDEST observation while a narrower one stays merged.
+
+    csvColumnCount must be driven by the rows actually emitted. Every other
+    fixture splits the narrowest (or the only) observation, so the one merged row
+    left is also the widest and its photo_count equals its padded photos.length
+    -- which makes a mutation to photos.length invisible. Here 111 becomes four
+    1-photo rows and 222 stays merged with 2 real photos inside a 4-wide padded
+    array: the correct column count is 2, and reading photos.length emits 4,
+    putting two empty mediaAsset column pairs in the file handed to Wildbook.
+    """
+    page = build_page(tmp_path, specs=[
+        {"id": 111, "n_photos": 4},
+        {"id": 222, "n_photos": 2},
+    ])
+    out = run_js(page, """
+        toggleSplit(111);                       // split the WIDEST one
+        const csv = generateCSV(getSelectedObservations()).split('\\n');
+        const header = csv[0].split(',');
+        const firstAsset = header.indexOf('Encounter.mediaAsset0');
+        const rows = csv.slice(1).map(l => l.split(','));
+        console.log(JSON.stringify({
+            assetColumns: header.slice(firstAsset),
+            raggedRows: rows.filter(r => r.length !== header.length).length,
+            // observation id plus the row's mediaAsset tail
+            tails: rows.map(r => [r[0]].concat(r.slice(firstAsset))),
+        }));
+    """)
+    result = json.loads(out)
+    # Two column pairs: the widest row written is 222's merged row, with 2 photos.
+    assert result["assetColumns"] == [
+        "Encounter.mediaAsset0", "Encounter.mediaAsset0.license",
+        "Encounter.mediaAsset1", "Encounter.mediaAsset1.license",
+    ], "column count was not sized from the widest row actually written"
+    assert result["raggedRows"] == 0
+    assert result["tails"] == [
+        # The split rows carry one photo each and one empty pair, because a wider
+        # merged row shares the export -- not because of the padded array.
+        ["111", "111_1.jpg", "cc-by", "", ""],
+        ["111", "111_2.jpg", "cc-by", "", ""],
+        ["111", "111_3.jpg", "cc-by", "", ""],
+        ["111", "111_4.jpg", "cc-by", "", ""],
+        ["222", "222_1.jpg", "cc-by", "222_2.jpg", "cc-by"],
+    ]
+
+
 def test_split_row_previews_the_photo_it_exports(tmp_path):
     """all_photo_paths must stay index-aligned with photos.
 
@@ -544,10 +634,21 @@ def test_split_row_previews_the_photo_it_exports(tmp_path):
         const assetIdx = csv[0].split(',').indexOf('Encounter.mediaAsset0');
         const exports = csv.slice(1).map(l => l.split(',')[assetIdx]);
 
-        // The modal must land on the photo the row previews, despite the gaps.
-        const galleryLandings = displayRows().map(r => {
-            const g = galleryFor(r.obs, r.photoIndex);
-            return g.gallery.length ? g.gallery[g.start] : null;
+        // The modal must land on the photo the row previews, despite the gaps --
+        // asserted by firing each row's REAL rendered handler, not by calling
+        // galleryFor directly. The mapping is worth nothing if renderRow does not
+        // route through it, and a directly-called helper cannot detect that.
+        const opened = __byId['observations-body'].children.map(tr => {
+            const cell = tr.children[1].children[0];
+            if (cell.className !== 'photo-preview') return null;
+            currentGallery = [];
+            currentImageIndex = -1;
+            cell.onclick();
+            return {
+                gallery: currentGallery,
+                index: currentImageIndex,
+                landedOn: currentGallery[currentImageIndex],
+            };
         });
 
         console.log(JSON.stringify({
@@ -555,7 +656,7 @@ def test_split_row_previews_the_photo_it_exports(tmp_path):
             paths: obs.all_photo_paths,
             previews: previews,
             exports: exports,
-            galleryLandings: galleryLandings,
+            opened: opened,
         }));
     """)
     result = json.loads(out)
@@ -573,10 +674,23 @@ def test_split_row_previews_the_photo_it_exports(tmp_path):
         assert preview in (None, f"photos/{exported}"), (
             f"row previews {preview} but exports {exported}"
         )
-    # And clicking a preview opens the gallery on that same photo.
-    for preview, landing in zip(result["previews"], result["galleryLandings"]):
-        if preview is not None:
-            assert landing == preview, f"gallery opened on {landing}, row shows {preview}"
+    # And clicking a preview really opens the gallery on that same photo: the
+    # gallery is compacted (no nulls, which the modal cannot display) and the
+    # start index is mapped into it, never the raw photo index.
+    compacted = ["photos/111_1.jpg", "photos/111_3.jpg", "photos/111_4.jpg"]
+    assert [o["index"] if o else None for o in result["opened"]] == [0, None, 1, 2], (
+        "the row's photo index reached openModal unmapped"
+    )
+    for preview, opened in zip(result["previews"], result["opened"]):
+        if preview is None:
+            assert opened is None, "a row with no preview still wired a click handler"
+            continue
+        assert opened["gallery"] == compacted, (
+            f"modal was handed {opened['gallery']}, which the viewer cannot display"
+        )
+        assert opened["landedOn"] == preview, (
+            f"gallery opened on {opened['landedOn']}, row shows {preview}"
+        )
 
 
 def test_flag_mode_respects_the_organism_evidence_suppression(tmp_path):
