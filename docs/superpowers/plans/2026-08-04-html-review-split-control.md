@@ -390,6 +390,7 @@ The generated page's JavaScript has no real test coverage — the only existing 
 - Produces:
   - `js_harness/run_page.js` — invoked as `node js_harness/run_page.js <page.html> <script.js>`; loads the page's inline script in a `vm` context with a stubbed DOM, runs the assertion script, prints its output.
   - `test_review_page_js.py::run_js(html_path, assertions) -> str` — writes the assertion snippet to a temp file, shells out to node, returns stdout. Skips the test when node is absent.
+  - `test_review_page_js.py::build_page(tmp_path, n_photos=4, social_split=False, licenses=None, observations=None)` — generates a real review page. `observations` accepts a list of `{"id": int, "n_photos": int, "licenses": [...]}"` specs for multi-observation fixtures; the scalar form builds a single observation. Tests that assert on ordering or cross-observation behaviour MUST use the list form — a single observation makes such assertions vacuous.
 
 - [ ] **Step 1: Write the harness**
 
@@ -653,15 +654,39 @@ def test_merged_row_sighting_id_depends_on_the_flag(tmp_path):
 
 
 def test_split_rows_stay_adjacent_after_sorting(tmp_path):
-    page = build_page(tmp_path, n_photos=3)
+    """Needs MORE THAN ONE observation, or it proves nothing.
+
+    Sorting ranks observations and then expands their photos. With a single
+    observation every row trivially belongs to it, so the assertion cannot fail
+    however broken the sort is. Two observations, one split and one not, with the
+    split one's first photo deselected so the sort actually has work to do, is
+    the smallest fixture that can detect scattering.
+    """
+    page = build_page(tmp_path, observations=[
+        {"id": 111, "n_photos": 3},
+        {"id": 222, "n_photos": 2},
+    ])
     out = run_js(page, """
         toggleSplit(111);
-        selectionState.set(rowKey(observations[0], 0), false);
+        // Deselect one photo of 111 so selected-first sorting has a reason to move rows.
+        selectionState.set(rowKey(observations.find(o => o.observation_id === 111), 0), false);
         renderObservations();
         console.log(JSON.stringify(displayRows().map(r => r.obs.observation_id)));
     """)
     ids = json.loads(out)
-    assert ids == [111, 111, 111], "an observation's photos were split apart by sorting"
+
+    # Every run of a given id must be contiguous: no id may reappear after a
+    # different id has intervened.
+    runs = [ids[0]]
+    for observation_id in ids[1:]:
+        if observation_id != runs[-1]:
+            runs.append(observation_id)
+    assert len(runs) == len(set(runs)), (
+        f"an observation's rows were scattered by sorting: {ids}"
+    )
+    # And the split observation really did expand, so the fixture is exercising it.
+    assert ids.count(111) == 3, ids
+    assert ids.count(222) == 1, ids
 
 
 def test_split_row_is_selected_on_its_own_licence(tmp_path):
