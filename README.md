@@ -5,9 +5,19 @@ A Python utility for downloading recent observations of specific species from iN
 ## Scope
 
 The supported, maintained entry point is **`inat-download-new-species-sightings.py`** — the
-iNaturalist → Wildbook downloader. The `inat-mcp-server/` directory (YouTube and Flickr search,
-experimental CLIP filtering) is legacy and **not** part of the Wildbook import workflow; it is
-kept for reference only and may be removed in a future release.
+iNaturalist → Wildbook downloader. The `inat-mcp-server/` directory (YouTube and Flickr search)
+is legacy and **not** part of the Wildbook import workflow; it is kept for reference only and may
+be removed in a future release. The experimental CLIP image filtering has been removed — it was
+never wired to a command-line flag and had no callers.
+
+Automated tests live at the repo root and need no network or API keys:
+
+```bash
+python3 -m pytest
+```
+
+`manual_checks/` holds live-API diagnostic scripts that require credentials and report by printing
+rather than asserting. See `manual_checks/README.md`.
 
 ## Features
 
@@ -69,7 +79,7 @@ python3 inat-download-new-species-sightings.py --species SPECIES_NAME [OPTIONS]
 - `--place`: Filter observations by place (e.g., "California", "Oregon", "United States")
 - `--use-locationID`: Location ID to add to Encounter.locationID column for all observations
 - `--use-submitterID`: Submitter ID to add to Encounter.submitterID column for all observations
-- `--social-split-observations`: Split multi-photo observations into separate CSV rows (one per photo) for social species. Each photo becomes a separate Encounter, linked by a shared Sighting.sightingID. Respects iNaturalist "single subject" annotations.
+- `--social-split-observations`: Split multi-photo observations into separate CSV rows (one per photo) for social species. Each photo becomes a separate Encounter, linked by a shared Sighting.sightingID. Observations annotated "Evidence of Presence: Organism" are currently not split — see the caveat below.
 
 ### Examples
 
@@ -220,12 +230,24 @@ python3 inat-download-new-species-sightings.py \
 - Observations with multiple photos are split into separate CSV rows (one per photo)
 - Each row represents a single Encounter in Wildbook
 - All rows from the same observation share a common `Sighting.sightingID` UUID to preserve the relationship
-- Observations marked with iNaturalist's "single subject" annotation are NOT split (all photos kept together)
+- Observations carrying iNaturalist's "Evidence of Presence: Organism" annotation are NOT split (all photos kept together)
 - Single-photo observations remain as single rows
 
 **Example result:**
 - Original: 1 observation with 4 photos → 4 CSV rows (each with 1 photo, same Sighting.sightingID)
-- "Single subject" observation with 3 photos → 1 CSV row (all 3 photos together)
+- "Evidence of Presence: Organism" observation with 3 photos → 1 CSV row (all 3 photos together)
+
+> **Open question — the split-suppression rule is probably too broad.** This
+> code was written believing iNaturalist has a "single subject" annotation
+> meaning one individual is pictured. It does not. What it actually reads is
+> the *Evidence of Presence* attribute with value *Organism*, which only says
+> the evidence is the animal itself rather than a track, scat, or feather — it
+> says nothing about how many individuals are present. Because most
+> wild-animal observations are annotated that way, splitting is suppressed for
+> the common case. Decide whether to (a) drop the suppression and split every
+> multi-photo observation, or (b) keep it and rename the flag to reflect what
+> it does. The behaviour is unchanged for now so no existing workflow shifts
+> underfoot.
 
 **HTML Review Mode Features (when using --social-split-observations):**
 - **Alternating row colors**: Rows from the same original observation are color-coded (alternating light green and white backgrounds) to help you identify which rows belong together
