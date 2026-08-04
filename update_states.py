@@ -4,7 +4,10 @@ Update Encounter.locationID in CSV based on Encounter.verbatimLocality
 Maps Brazilian municipalities and states to their correct state names
 """
 
+import argparse
 import csv
+import os
+import tempfile
 
 # Mapping of localities to Brazilian states
 # Based on the unique localities found in the CSV
@@ -74,11 +77,24 @@ def update_csv(input_file, output_file):
 
             rows.append(row)
 
-    # Write updated CSV
-    with open(output_file, 'w', encoding='utf-8', newline='') as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    # Write to a temporary file in the destination directory, then rename over
+    # the target. Writing straight to output_file meant an interruption or a
+    # full disk left the only copy of the bulk-import CSV truncated -- and the
+    # shipped defaults had output_file == input_file.
+    out_path = os.path.abspath(output_file)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(out_path) or '.', prefix='.update_states-', suffix='.csv'
+    )
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as outfile:
+            writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
     print(f"\nUpdate complete!")
     print(f"Rows updated: {rows_updated}")
@@ -87,7 +103,16 @@ def update_csv(input_file, output_file):
     print(f"Output written to: {output_file}")
 
 if __name__ == "__main__":
-    input_file = "/mnt/c/inat-download-recent-species-sightings/data/inat_observations_export_Panthera-onca_Brazil_20251103.csv"
-    output_file = "/mnt/c/inat-download-recent-species-sightings/data/inat_observations_export_Panthera-onca_Brazil_20251103.csv"
+    parser = argparse.ArgumentParser(
+        description="Map Encounter.verbatimLocality to a Brazilian state in Encounter.locationID."
+    )
+    parser.add_argument('input_file', help='CSV to read')
+    parser.add_argument(
+        '-o', '--output',
+        help='CSV to write (default: alongside the input, with a .updated.csv suffix). '
+             'Pass the input path explicitly to edit in place.'
+    )
+    args = parser.parse_args()
 
-    update_csv(input_file, output_file)
+    output = args.output or args.input_file.replace('.csv', '') + '.updated.csv'
+    update_csv(args.input_file, output)
