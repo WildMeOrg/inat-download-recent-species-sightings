@@ -226,7 +226,7 @@ def test_dedup_runs_before_splitting_so_split_rows_cannot_collapse():
 - [ ] **Step 8: Run the full suite**
 
 Run: `python3 -m pytest -q`
-Expected: PASS. `test_merged_export_column_count_covers_recombined_photos` still passes at this point — it greps generated HTML and is replaced in Task 5.
+Expected: PASS. `test_merged_export_column_count_covers_recombined_photos` still passes at this point — it greps generated HTML, and Task 4 removes it alongside the merge code it describes.
 
 - [ ] **Step 9: Verify the CSV output is unchanged**
 
@@ -985,18 +985,29 @@ pathlib.Path('/tmp/page.js').write_text(re.search(r'<script>\n(.*)\n    </script
 " && node --check /tmp/page.js
 ```
 
-- [ ] **Step 9: Verify no Python SyntaxWarning and run the full suite**
+- [ ] **Step 9: Delete the test that asserts the removed merge behavior**
+
+Remove `test_merged_export_column_count_covers_recombined_photos` from
+`test_export_integrity.py` entirely. It asserts `"function csvColumnCount" in html`,
+which proves nothing about behavior and describes a code path this task just deleted.
+`test_deselecting_one_photo_drops_only_that_row_from_the_csv` above covers the real
+concern — that column sizing follows the rows actually emitted.
+
+It is deleted here, in the same commit as the code it describes, so every commit on the
+branch stays green and the diff is self-consistent.
+
+- [ ] **Step 10: Verify no Python SyntaxWarning and run the full suite**
 
 Run: `python3 -W error::SyntaxWarning -c "import io,ast; ast.parse(io.open('inat-download-new-species-sightings.py',encoding='utf-8').read()); print('clean')"`
 Expected: `clean`
 
 Run: `python3 -m pytest -q`
-Expected: one failure — `test_merged_export_column_count_covers_recombined_photos`, which greps for the removed merge behavior. Task 5 replaces it.
+Expected: PASS — no failures. If anything is red, this task is not done.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-git add inat-download-new-species-sightings.py test_review_page_js.py
+git add inat-download-new-species-sightings.py test_review_page_js.py test_export_integrity.py
 git commit -m "feat: add a per-observation Split/Unsplit control to the review page
 
 Replaces the Merge machinery with one grouping model. splitState is seeded
@@ -1013,26 +1024,23 @@ observation deselected wholesale by the all-or-nothing rule."
 
 ---
 
-### Task 5: Retire the stale grep test and document the control
+### Task 5: Document the control
 
 **Files:**
-- Modify: `test_export_integrity.py` (remove one test), `README.md`
+- Modify: `README.md`
 - Test: the full suite
 
 **Interfaces:**
 - Consumes: everything above.
-- Produces: no code interfaces; docs and test cleanup.
+- Produces: no code interfaces; documentation only.
 
-- [ ] **Step 1: Delete the string-grep test**
-
-Remove `test_merged_export_column_count_covers_recombined_photos` from `test_export_integrity.py` entirely. It asserts `"function csvColumnCount" in html`, which proves nothing about behavior and now describes a code path that no longer exists. `test_deselecting_one_photo_drops_only_that_row_from_the_csv` in `test_review_page_js.py` covers the real concern — that column sizing follows the rows actually emitted.
-
-- [ ] **Step 2: Run the full suite**
+- [ ] **Step 1: Confirm the starting state is green**
 
 Run: `python3 -m pytest -q`
-Expected: PASS, with more tests than the 34 this branch started at.
+Expected: PASS, with more tests than the 34 this branch started at. The stale grep test
+was already removed in Task 4 alongside the code it described.
 
-- [ ] **Step 3: Update the README**
+- [ ] **Step 2: Update the README**
 
 In the `--social-split-observations` section, replace the "HTML Review Mode Features" bullet list describing the Merge button with:
 
@@ -1063,20 +1071,19 @@ Then update the open-question block in that section, appending:
 > question of what the flag's default *should* be is still open.
 ```
 
-- [ ] **Step 4: Verify the docs match the code**
+- [ ] **Step 3: Verify the docs match the code**
 
 Run: `grep -c "btn-split\|Unsplit" inat-download-new-species-sightings.py`
 Expected: a non-zero count, confirming the README describes shipped behavior.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add test_export_integrity.py README.md
-git commit -m "docs: document the Split control; drop a string-grep test
+git add README.md
+git commit -m "docs: document the per-observation Split control
 
-The removed test asserted that the generated HTML contained the string
-'function csvColumnCount', which proved nothing about behaviour and described a
-code path that no longer exists. The Node tests cover the real concern."
+Every multi-photo observation now gets a Split button regardless of the flag,
+so --social-split-observations only sets the starting state."
 ```
 
 ---
@@ -1150,7 +1157,7 @@ Expected: `OK: non-split CSV unchanged`.
 
 ## Self-Review
 
-**Spec coverage.** Every section maps to a task: the Python seam and sighting-ID handling to Task 1; the payload additions to Task 2; the browser model, export path and `csvColumnCount` change to Task 4; the JS harness and its seven named behaviors to Tasks 3-4; the three existing-test rewrites to Tasks 1 (two of them) and 5 (the grep); the self-contained-page constraint to Global Constraints; end-to-end verification to Task 6. Decision 4's mode-dependent rule is implemented in Task 4 Step 7 with the required comment, and guarded by `test_merged_row_sighting_id_depends_on_the_flag`. Out-of-scope items are not implemented anywhere, as intended.
+**Spec coverage.** Every section maps to a task: the Python seam and sighting-ID handling to Task 1; the payload additions to Task 2; the browser model, export path and `csvColumnCount` change to Task 4; the JS harness and its seven named behaviors to Tasks 3-4; the three existing-test rewrites to Tasks 1 (two of them) and 4 (the grep, deleted with the code it described); the self-contained-page constraint to Global Constraints; end-to-end verification to Task 6. Decision 4's mode-dependent rule is implemented in Task 4 Step 7 with the required comment, and guarded by `test_merged_row_sighting_id_depends_on_the_flag`. Out-of-scope items are not implemented anywhere, as intended.
 
 **Placeholder scan.** No TBDs. Every code step carries real code. The one abbreviated block — the `headers` array in Task 4 Step 7 — is explicitly marked unchanged, with an instruction to keep the existing contents, because reproducing 26 unchanged lines invites a transcription error.
 
