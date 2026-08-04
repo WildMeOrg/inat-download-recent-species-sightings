@@ -62,21 +62,20 @@ def _downloader(tmp, **kwargs):
     return d
 
 
-def test_dedup_keeps_every_social_split_row():
-    """Splitting one 4-photo observation must survive deduplication as 4 rows."""
+def test_dedup_runs_before_splitting_so_split_rows_cannot_collapse():
+    """The 8c70595 bug, now structurally impossible: dedup only sees whole observations."""
     with tempfile.TemporaryDirectory() as tmp:
         d = _downloader(tmp, social_split=True)
         rows = d.process_observations([_obs(n_photos=4)], "Panthera onca")
-        assert len(rows) == 4, f"split produced {len(rows)} rows, expected 4"
+        rows += d.process_observations([_obs(n_photos=4)], "jaguar")  # same taxon, twice
+        assert len(rows) == 2
 
         deduped = d.deduplicate_rows(rows)
-        assert len(deduped) == 4, (
-            f"deduplication collapsed {len(rows)} split rows to {len(deduped)}; "
-            "each photo must remain its own Encounter"
-        )
-        assert len({r["photo_filenames"] for r in deduped}) == 4, (
-            "the surviving rows all point at the same photo"
-        )
+        assert len(deduped) == 1, "the same observation survived twice"
+
+        split = mod.split_rows_by_photo(deduped)
+        assert len(split) == 4, f"splitting after dedup gave {len(split)} rows, expected 4"
+        assert len({r["photo_filenames"] for r in split}) == 4
 
 
 def test_dedup_still_collapses_true_duplicates():
@@ -192,6 +191,62 @@ def test_both_export_paths_emit_the_same_columns():
         f"  only in CSV:  {[c for c in python_columns if c not in browser_columns]}\n"
         f"  only in HTML: {[c for c in browser_columns if c not in python_columns]}"
     )
+
+
+def test_process_observations_always_returns_one_row_per_observation():
+    """Splitting is no longer process_observations' job, in either flag mode."""
+    for social_split in (False, True):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = _downloader(tmp, social_split=social_split)
+            rows = d.process_observations([_obs(n_photos=4)], "Panthera onca")
+            assert len(rows) == 1, f"social_split={social_split} gave {len(rows)} rows"
+            assert len(rows[0]["_photo_list"]) == 4
+            # The column stays empty; the UUID rides along internally until promoted.
+            assert rows[0]["Sighting.sightingID"] is None
+            assert rows[0]["_sighting_id"]
+
+
+def test_split_rows_by_photo_expands_eligible_rows():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _downloader(tmp, social_split=True)
+        rows = d.process_observations([_obs(n_photos=4)], "Panthera onca")
+        split = mod.split_rows_by_photo(rows)
+
+        assert len(split) == 4
+        assert [len(r["_photo_list"]) for r in split] == [1, 1, 1, 1]
+        assert [r["photo_count"] for r in split] == [1, 1, 1, 1]
+        # All four are one sighting.
+        ids = {r["Sighting.sightingID"] for r in split}
+        assert len(ids) == 1 and ids != {None}
+        assert ids == {rows[0]["_sighting_id"]}
+        # Each row names exactly its own photo.
+        assert [r["photo_filenames"] for r in split] == [p for p in rows[0]["_photo_list"]]
+        # Unrelated fields survive.
+        assert all(r["Encounter.otherCatalogNumbers"] == "iNaturalist:111" for r in split)
+
+
+def test_split_rows_by_photo_leaves_ineligible_rows_alone():
+    """Single-photo rows, and organism-evidence rows, pass straight through."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _downloader(tmp, social_split=True)
+        single = d.process_observations([_obs(n_photos=1)], "Panthera onca")
+        assert mod.split_rows_by_photo(single) == single
+
+        organism = _obs(n_photos=4)
+        organism["annotations"] = [{"controlled_attribute_id": 22, "controlled_value_id": 24}]
+        rows = d.process_observations([organism], "Panthera onca")
+        assert rows[0]["_split_eligible"] is False
+        assert mod.split_rows_by_photo(rows) == rows
+
+
+def test_split_rows_by_photo_is_pure():
+    """It must not mutate its input; run() relies on that for the HTML path."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _downloader(tmp, social_split=True)
+        rows = d.process_observations([_obs(n_photos=3)], "Panthera onca")
+        before = [dict(r) for r in rows]
+        mod.split_rows_by_photo(rows)
+        assert rows == before
 
 
 if __name__ == "__main__":

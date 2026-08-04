@@ -77,6 +77,48 @@ def fetch_json(url: str, rate_limit: float = 1.0, timeout: int = HTTP_TIMEOUT,
     )
 
 
+def split_rows_by_photo(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Expand each split-eligible row into one row per photo.
+
+    Rows sharing an observation become one Wildbook Sighting: they all carry the
+    observation's pre-generated _sighting_id in Sighting.sightingID.
+
+    This runs *after* deduplication, which is deliberate. When splitting happened
+    inside process_observations(), deduplicate_rows() saw the split rows and
+    collapsed them back to one -- silently turning --social-split-observations
+    into a no-op. Keeping the split downstream makes that impossible.
+
+    Args:
+        rows: Processed observation rows, one per observation
+
+    Returns:
+        A new list; the input rows are not modified
+    """
+    expanded = []
+
+    for row in rows:
+        photo_list = row.get('_photo_list', [])
+        license_list = row.get('_license_list', [])
+
+        if not row.get('_split_eligible') or len(photo_list) <= 1:
+            expanded.append(row)
+            continue
+
+        for photo_index, photo_filename in enumerate(photo_list):
+            split_row = dict(row)
+            split_row['Sighting.sightingID'] = row['_sighting_id']
+            split_row['photo_count'] = 1
+            split_row['photo_filenames'] = photo_filename
+            split_row['_photo_list'] = [photo_filename]
+            split_row['_license_list'] = (
+                [license_list[photo_index]] if photo_index < len(license_list) else []
+            )
+            expanded.append(split_row)
+
+    return expanded
+
+
 class iNaturalistDownloader:
     """Downloads observations and photos from iNaturalist API."""
 
@@ -573,92 +615,56 @@ class iNaturalistDownloader:
             # Generate project name based on species taxonomy
             project_name = self.generate_project_name(encounter_genus, encounter_specific_epithet)
 
-            # If social_split is enabled and there are multiple photos, create one row per photo
-            if self.social_split and len(photo_filenames) > 1 and not has_organism_evidence:
-                # Generate a common sighting ID for all photos from this observation
-                sighting_id = str(uuid.uuid4())
+            # Every observation gets a sighting ID, but it stays internal until a
+            # split actually needs it -- either split_rows_by_photo() on the CSV
+            # path, or the reviewer's Split button on the HTML path. Promoting it
+            # unconditionally would populate a column that is empty today.
+            sighting_id = None
+            split_eligible = (
+                self.social_split
+                and len(photo_filenames) > 1
+                and not has_organism_evidence
+            )
 
-                # Create one row for each photo
-                for photo_idx, (photo_filename, photo_license) in enumerate(zip(photo_filenames, photo_licenses)):
-                    row = {
-                        'observation_id': obs_id,
-                        'observed_on': observed_on,
-                        'Encounter.year': encounter_year,
-                        'Encounter.month': encounter_month,
-                        'Encounter.day': encounter_day,
-                        'scientific_name': scientific_name,
-                        'Encounter.genus': encounter_genus,
-                        'Encounter.specificEpithet': encounter_specific_epithet,
-                        'common_name': common_name,
-                        'Encounter.decimalLatitude': latitude,
-                        'Encounter.decimalLongitude': longitude,
-                        'Encounter.verbatimLocality': place_guess,
-                        'Encounter.locationID': self.location_id if self.location_id else None,
-                        'Encounter.livingStatus': living_status,
-                        'Encounter.submitterID': self.submitter_id if self.submitter_id else 'public',
-                        'Encounter.state': 'unapproved',
-                        'Encounter.project0.researchProjectName': project_name,
-                        'Encounter.project0.ownerUsername': self.project_owner if self.project_owner else None,
-                        'observer': observer,
-                        'quality_grade': quality_grade,
-                        'url': obs_url,
-                        'Encounter.otherCatalogNumbers': f'iNaturalist:{obs_id}',
-                        'Encounter.researcherComments': researcher_comments,
-                        'Sighting.sightingID': sighting_id,
-                        'photo_count': 1,  # Each row has one photo
-                        'photo_filenames': photo_filename,
-                        '_photo_list': [photo_filename],  # Single photo for this encounter
-                        '_license_list': [photo_license],  # Single license for this encounter
-                        '_has_non_organism_evidence': has_non_organism_evidence,  # For HTML deselection
-                        '_is_skulls_and_bones': is_skulls_and_bones,  # For HTML deselection
-                        '_coordinates_obscured': obscured,  # For HTML display
-                        '_geoprivacy': geoprivacy,  # User-set geoprivacy
-                        '_taxon_geoprivacy': taxon_geoprivacy,  # Auto geoprivacy from conservation status
-                        '_public_positional_accuracy': public_positional_accuracy  # Accuracy in meters
-                    }
-                    processed_data.append(row)
-            else:
-                # Original behavior: one row per observation
-                # Sighting ID only populated when social_split is enabled
-                sighting_id = str(uuid.uuid4()) if self.social_split and len(photo_filenames) >= 1 else None
-
-                row = {
-                    'observation_id': obs_id,
-                    'observed_on': observed_on,
-                    'Encounter.year': encounter_year,
-                    'Encounter.month': encounter_month,
-                    'Encounter.day': encounter_day,
-                    'scientific_name': scientific_name,
-                    'Encounter.genus': encounter_genus,
-                    'Encounter.specificEpithet': encounter_specific_epithet,
-                    'common_name': common_name,
-                    'Encounter.decimalLatitude': latitude,
-                    'Encounter.decimalLongitude': longitude,
-                    'Encounter.verbatimLocality': place_guess,
-                    'Encounter.locationID': self.location_id if self.location_id else None,
-                    'Encounter.livingStatus': living_status,
-                    'Encounter.submitterID': self.submitter_id if self.submitter_id else 'public',
-                    'Encounter.state': 'unapproved',
-                    'Encounter.project0.researchProjectName': project_name,
-                    'Encounter.project0.ownerUsername': self.project_owner if self.project_owner else None,
-                    'observer': observer,
-                    'quality_grade': quality_grade,
-                    'url': obs_url,
-                    'Encounter.otherCatalogNumbers': f'iNaturalist:{obs_id}',
-                    'Encounter.researcherComments': researcher_comments,
-                    'Sighting.sightingID': sighting_id,
-                    'photo_count': len(photo_filenames),
-                    'photo_filenames': '; '.join(photo_filenames),
-                    '_photo_list': photo_filenames,  # Temporary field for photo processing
-                    '_license_list': photo_licenses,  # Temporary field for license processing
-                    '_has_non_organism_evidence': has_non_organism_evidence,  # For HTML deselection
-                    '_is_skulls_and_bones': is_skulls_and_bones,  # For HTML deselection
-                    '_coordinates_obscured': obscured,  # For HTML display
-                    '_geoprivacy': geoprivacy,  # User-set geoprivacy
-                    '_taxon_geoprivacy': taxon_geoprivacy,  # Auto geoprivacy from conservation status
-                    '_public_positional_accuracy': public_positional_accuracy  # Accuracy in meters
-                }
-                processed_data.append(row)
+            row = {
+                'observation_id': obs_id,
+                'observed_on': observed_on,
+                'Encounter.year': encounter_year,
+                'Encounter.month': encounter_month,
+                'Encounter.day': encounter_day,
+                'scientific_name': scientific_name,
+                'Encounter.genus': encounter_genus,
+                'Encounter.specificEpithet': encounter_specific_epithet,
+                'common_name': common_name,
+                'Encounter.decimalLatitude': latitude,
+                'Encounter.decimalLongitude': longitude,
+                'Encounter.verbatimLocality': place_guess,
+                'Encounter.locationID': self.location_id if self.location_id else None,
+                'Encounter.livingStatus': living_status,
+                'Encounter.submitterID': self.submitter_id if self.submitter_id else 'public',
+                'Encounter.state': 'unapproved',
+                'Encounter.project0.researchProjectName': project_name,
+                'Encounter.project0.ownerUsername': self.project_owner if self.project_owner else None,
+                'observer': observer,
+                'quality_grade': quality_grade,
+                'url': obs_url,
+                'Encounter.otherCatalogNumbers': f'iNaturalist:{obs_id}',
+                'Encounter.researcherComments': researcher_comments,
+                'Sighting.sightingID': sighting_id,
+                'photo_count': len(photo_filenames),
+                'photo_filenames': '; '.join(photo_filenames),
+                '_photo_list': photo_filenames,  # Temporary field for photo processing
+                '_license_list': photo_licenses,  # Temporary field for license processing
+                '_has_non_organism_evidence': has_non_organism_evidence,  # For HTML deselection
+                '_is_skulls_and_bones': is_skulls_and_bones,  # For HTML deselection
+                '_coordinates_obscured': obscured,  # For HTML display
+                '_geoprivacy': geoprivacy,  # User-set geoprivacy
+                '_taxon_geoprivacy': taxon_geoprivacy,  # Auto geoprivacy from conservation status
+                '_public_positional_accuracy': public_positional_accuracy,  # Accuracy in meters
+                '_sighting_id': str(uuid.uuid4()),  # Promoted to the column only when split
+                '_split_eligible': split_eligible,  # Whether the flag would split this one
+            }
+            processed_data.append(row)
 
         return processed_data
 
@@ -2157,8 +2163,13 @@ class iNaturalistDownloader:
                 html_filename = f"inat_observations_review_{species_part}{place_part}_{timestamp}.html"
                 self.write_html(all_observations_data, html_filename)
             else:
+                # The HTML path does its own splitting in the browser, so only the
+                # direct-CSV path needs it applied here.
+                csv_rows = all_observations_data
+                if self.social_split:
+                    csv_rows = split_rows_by_photo(csv_rows)
                 csv_filename = f"inat_observations_{species_part}{place_part}_{timestamp}.csv"
-                self.write_csv(all_observations_data, csv_filename)
+                self.write_csv(csv_rows, csv_filename)
 
             print("\n" + "=" * 60)
             print("Download complete!")
