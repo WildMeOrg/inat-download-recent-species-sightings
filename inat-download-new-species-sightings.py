@@ -818,12 +818,21 @@ class iNaturalistDownloader:
                     # Create relative path from HTML file to photo
                     photo_path = f"photos/{photo_list[0]}"
 
-            # Build array of all photo paths for gallery
-            all_photo_paths = []
-            for photo_filename in photo_list:
-                photo_file_path = self.photos_dir / photo_filename
-                if photo_file_path.exists():
-                    all_photo_paths.append(f"photos/{photo_filename}")
+            # Displayable path per photo, or None when the download failed.
+            #
+            # INVARIANT: len(all_photo_paths) == len(photo_list), so this list is
+            # index-aligned with _photo_list, photos, licenses and photo_licensed.
+            # A missing file MUST become None rather than be dropped: a split row
+            # previews all_photo_paths[i] and exports photos[i], so compacting
+            # this list would shift every later row's preview and show the
+            # reviewer a different photo from the one they are deciding about.
+            # The gallery skips the Nones instead (see galleryFor() in the page).
+            all_photo_paths = [
+                f"photos/{photo_filename}"
+                if (self.photos_dir / photo_filename).exists() else None
+                for photo_filename in photo_list
+            ]
+            assert len(all_photo_paths) == len(photo_list)
 
             # Get unique licenses for display
             unique_licenses = list(set([lic for lic in license_list if lic]))
@@ -1570,6 +1579,21 @@ class iNaturalistDownloader:
             return isSelected(obs, null);
         }}
 
+        // all_photo_paths holds null where a photo failed to download, so it stays
+        // index-aligned with photos. The modal cannot display a null, so hand it a
+        // compacted list and translate this row's photo index into that list --
+        // never pass photoIndex straight through as a gallery position.
+        function galleryFor(obs, photoIndex) {{
+            const paths = obs.all_photo_paths || [];
+            const gallery = paths.filter(p => p);
+            const target = photoIndex === null ? 0 : photoIndex;
+            let start = 0;
+            for (let i = 0; i < target && i < paths.length; i++) {{
+                if (paths[i]) start++;
+            }}
+            return {{gallery: gallery, start: Math.min(start, Math.max(0, gallery.length - 1))}};
+        }}
+
         // Builds every cell of one display row: `photoIndex` is null for a merged
         // row (the whole observation) or the zero-based photo for a split row.
         function renderRow(tr, obs, photoIndex) {{
@@ -1588,7 +1612,9 @@ class iNaturalistDownloader:
             tdCheckbox.appendChild(checkbox);
             tr.appendChild(tdCheckbox);
 
-            // Photo preview. A split row previews its own photo.
+            // Photo preview. A split row previews the photo it will export --
+            // all_photo_paths is index-aligned with photos (null where a download
+            // failed), so photoIndex means the same thing in both.
             const photoPath = photoIndex === null
                 ? obs.photo_path
                 : (obs.all_photo_paths && obs.all_photo_paths[photoIndex]) || null;
@@ -1599,7 +1625,10 @@ class iNaturalistDownloader:
                 img.className = 'photo-preview';
                 img.alt = 'Observation photo';
                 // Open the gallery on the photo this row shows, not always the first.
-                img.onclick = () => openModal(obs.all_photo_paths, photoIndex === null ? 0 : photoIndex);
+                img.onclick = () => {{
+                    const g = galleryFor(obs, photoIndex);
+                    openModal(g.gallery, g.start);
+                }};
                 tdPhoto.appendChild(img);
             }} else {{
                 const noPhoto = document.createElement('div');
@@ -1721,16 +1750,21 @@ class iNaturalistDownloader:
             tdPhotoCount.textContent = photoIndex === null ? obs.photo_count : 1;
             tr.appendChild(tdPhotoCount);
 
-            // Split / Unsplit control
-            const tdSplit = document.createElement('td');
-            if (obs.photo_count > 1) {{
-                const btn = document.createElement('button');
-                btn.className = 'btn-split' + (isSplit(obs) ? ' split' : '');
-                btn.textContent = isSplit(obs) ? 'Unsplit' : 'Split';
-                btn.onclick = () => toggleSplit(obs.observation_id);
-                tdSplit.appendChild(btn);
+            // Split / Unsplit control. Appended only when the Split column exists
+            // at all -- initializeSplitColumn() keeps its <th> hidden when nothing
+            // on the page can be split, and an unconditional cell here would leave
+            // such a page with 12 <td> under 11 visible <th>.
+            if (maxPhotos > 1) {{
+                const tdSplit = document.createElement('td');
+                if (obs.photo_count > 1) {{
+                    const btn = document.createElement('button');
+                    btn.className = 'btn-split' + (isSplit(obs) ? ' split' : '');
+                    btn.textContent = isSplit(obs) ? 'Unsplit' : 'Split';
+                    btn.onclick = () => toggleSplit(obs.observation_id);
+                    tdSplit.appendChild(btn);
+                }}
+                tr.appendChild(tdSplit);
             }}
-            tr.appendChild(tdSplit);
         }}
 
         function handleCheckboxChange() {{
@@ -1752,7 +1786,17 @@ class iNaturalistDownloader:
         }}
 
         function setAllSelected(value) {{
-            displayRows().forEach(r => selectionState.set(rowKey(r.obs, r.photoIndex), value));
+            // Write BOTH sides of every split toggle, not just the rows on screen.
+            // An explicit "Deselect All" has to survive a later Split: writing only
+            // the current display rows would leave the other side unkeyed, and
+            // defaultSelected() would then re-seed it and silently re-arm rows the
+            // reviewer had excluded.
+            observations.forEach(obs => {{
+                selectionState.set(rowKey(obs, null), value);
+                for (let i = 0; i < obs.photo_count; i++) {{
+                    selectionState.set(rowKey(obs, i), value);
+                }}
+            }});
             renderObservations();
             updateCSV();
         }}

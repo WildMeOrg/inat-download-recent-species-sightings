@@ -9,6 +9,7 @@ is not installed rather than failing.
 
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -30,7 +31,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def build_page(tmp_path, n_photos=4, social_split=False, licenses=None, specs=None):
+def build_page(tmp_path, n_photos=4, social_split=False, licenses=None, specs=None,
+               missing_photos=None):
     """Generate a real review page and return its path.
 
     The simple call style is unchanged: `build_page(tmp_path, n_photos=4)`
@@ -45,28 +47,48 @@ def build_page(tmp_path, n_photos=4, social_split=False, licenses=None, specs=No
     "id"/"n_photos"/"licenses" win; a missing "id" falls back to 111 plus its
     position in the list, and missing "n_photos"/"licenses" fall back to this
     function's own n_photos/licenses arguments.
+
+    Two further per-spec keys, both also accepted as plain arguments for the
+    single-observation style:
+
+    "annotations" -- raw iNaturalist annotation dicts, e.g.
+        [{"controlled_attribute_id": 22, "controlled_value_id": 24}]
+    for "Evidence of Presence: Organism", which suppresses initially_split even
+    with the flag on. Without this a flag-mode test cannot tell splitState
+    seeded from initially_split apart from splitState seeded from the flag.
+
+    "missing_photos" -- 1-based photo numbers whose stub file is deliberately
+    NOT written, simulating a failed download. write_html then records None at
+    that index of all_photo_paths, which is what keeps previews aligned with
+    exports; a test needs this to prove a split row previews the photo it
+    exports rather than a later one.
     """
     if specs is None:
-        specs = [{"id": 111, "n_photos": n_photos, "licenses": licenses}]
+        specs = [{"id": 111, "n_photos": n_photos, "licenses": licenses,
+                  "missing_photos": missing_photos}]
 
     obs_payloads = []
-    photo_counts = []  # (obs_id, count) -- used below to write stub photo files
+    photo_plan = []  # (obs_id, count, missing) -- used to write stub photo files
     for i, spec in enumerate(specs):
         obs_id = spec.get("id", 111 + i)
         obs_n_photos = spec.get("n_photos", n_photos)
         obs_licenses = spec.get("licenses", licenses)
+        obs_missing = spec.get("missing_photos", missing_photos) or []
         photos = []
         for j in range(obs_n_photos):
             code = "cc-by" if obs_licenses is None else obs_licenses[j]
             photos.append({"url": "https://example.test/a/square.jpg", "license_code": code})
-        obs_payloads.append({
+        payload = {
             "id": obs_id,
             "taxon": {"name": "Panthera onca", "preferred_common_name": "Jaguar"},
             "observed_on": "2026-07-01",
             "place_guess": "Pantanal",
             "photos": photos,
-        })
-        photo_counts.append((obs_id, obs_n_photos))
+        }
+        if spec.get("annotations"):
+            payload["annotations"] = spec["annotations"]
+        obs_payloads.append(payload)
+        photo_plan.append((obs_id, obs_n_photos, obs_missing))
 
     d = mod.iNaturalistDownloader(
         output_dir=str(tmp_path), days_back=1, species_list=["Panthera onca"],
@@ -74,11 +96,33 @@ def build_page(tmp_path, n_photos=4, social_split=False, licenses=None, specs=No
     )
     d.download_photo = lambda url, filename: True
     rows = d.process_observations(obs_payloads, "Panthera onca")
-    for obs_id, count in photo_counts:
+    for obs_id, count, missing in photo_plan:
         for i in range(1, count + 1):
+            if i in missing:
+                continue
             (tmp_path / "photos" / f"{obs_id}_{i}.jpg").write_bytes(b"x")
     d.write_html(rows, "review.html")
     return tmp_path / "review.html"
+
+
+def _visible_header_cells(page, split_header_revealed):
+    """How many <th> cells a reader actually sees, so a test can compare that
+    against the <td> count the JS produced and catch a head/body mismatch.
+
+    The Split <th> ships with display:none and is revealed at runtime by
+    initializeSplitColumn(), so the caller passes what it observed happening.
+    """
+    html = page.read_text(encoding="utf-8")
+    # Scoped to the table head: the inline script's comments mention <th> too.
+    head = re.search(r"<thead>(.*?)</thead>", html, re.S)
+    assert head, "no <thead> in the generated page"
+    cells = re.findall(r"<th\b[^>]*>", head.group(1))
+    assert len(cells) == 12, f"expected 12 <th> in the table head, found {len(cells)}"
+    hidden = [c for c in cells if "display: none" in c]
+    assert len(hidden) == 1 and "split-header" in hidden[0], (
+        f"expected exactly the Split header to ship hidden, got {hidden}"
+    )
+    return len(cells) - (0 if split_header_revealed else 1)
 
 
 def run_js(page, assertions):
@@ -312,10 +356,252 @@ def test_split_row_is_selected_on_its_own_licence(tmp_path):
 
 
 def test_single_photo_observation_has_no_split_button(tmp_path):
+    """Negative test, so it also proves a row was rendered at all -- otherwise
+    an empty table would satisfy it and it would pass however broken the
+    control is (it passed before the feature existed)."""
     page = build_page(tmp_path, n_photos=1)
     out = run_js(page, """
+        initializeSplitColumn();
         renderObservations();
-        const labels = __created.filter(e => e.className.includes('btn-split')).map(e => e.textContent);
-        console.log(JSON.stringify(labels));
+        const rows = __byId['observations-body'].children;
+        console.log(JSON.stringify({
+            labels: __created.filter(e => e.className.includes('btn-split')).map(e => e.textContent),
+            renderedRows: rows.length,
+            cellCounts: [...new Set(rows.map(tr => tr.children.length))],
+            headerRevealed: __byId['split-header'].style.display === '',
+        }));
     """)
-    assert json.loads(out) == []
+    result = json.loads(out)
+    assert result["labels"] == []
+    assert result["renderedRows"] == 1, "nothing was rendered, so the test is vacuous"
+    # Nothing on this page can be split, so the Split column does not exist:
+    # its <th> stays hidden AND no <td> is appended, or the body would carry one
+    # more cell than the head shows.
+    assert result["headerRevealed"] is False
+    assert result["cellCounts"] == [11] == [_visible_header_cells(page, False)]
+
+
+def test_split_button_renders_and_clicking_it_splits_the_observation(tmp_path):
+    """The control itself, not just the model underneath it.
+
+    Every one of these passed the model-only suite: wiring onclick to
+    sighting_id instead of observation_id, never appending the cell, never
+    revealing the header, never relabelling to Unsplit, dropping the group
+    striping. So this test asserts the button exists, says 'Split', that
+    invoking its real handler splits the observation, and that the re-rendered
+    rows are relabelled, striped, and have the right cell count.
+    """
+    page = build_page(tmp_path, n_photos=4)
+    out = run_js(page, """
+        initializeSplitColumn();
+        renderObservations();
+        const buttons = () => __created.filter(e => e.className.includes('btn-split'));
+        const before = buttons();
+        if (before.length !== 1) throw new Error('expected 1 Split button, got ' + before.length);
+        const labelBefore = before[0].textContent;
+
+        before[0].onclick();   // the handler a real click would run
+
+        const after = buttons().slice(before.length);   // buttons from the re-render
+        const rows = __byId['observations-body'].children;
+        console.log(JSON.stringify({
+            labelBefore: labelBefore,
+            rowsAfter: displayRows().length,
+            renderedRowsAfter: rows.length,
+            labelsAfter: [...new Set(after.map(e => e.textContent))],
+            classesAfter: [...new Set(after.map(e => e.className))],
+            headerDisplay: __byId['split-header'].style.display,
+            cellCounts: [...new Set(rows.map(tr => tr.children.length))],
+            allStriped: rows.every(tr => tr.classList.contains('obs-group-even')
+                                      || tr.classList.contains('obs-group-odd')),
+        }));
+    """)
+    result = json.loads(out)
+    assert result["labelBefore"] == "Split"
+    assert result["rowsAfter"] == 4, "the button's handler did not split the observation"
+    assert result["renderedRowsAfter"] == 4, "the split rows were not rendered"
+    assert result["labelsAfter"] == ["Unsplit"]
+    assert result["classesAfter"] == ["btn-split split"]
+    assert result["headerDisplay"] == "", "the Split column header was never revealed"
+    assert result["allStriped"] is True, "split rows lost their group striping"
+    assert result["cellCounts"] == [12] == [_visible_header_cells(page, True)]
+
+
+def test_bulk_deselect_survives_a_later_split(tmp_path):
+    """"Deselect All" then Split must not silently re-arm the excluded rows.
+
+    setAllSelected only ever saw the rows on screen, so the other side of the
+    toggle stayed unkeyed and defaultSelected() re-seeded it to true.
+    """
+    page = build_page(tmp_path, n_photos=3)
+    out = run_js(page, """
+        renderObservations();
+        deselectAll();
+        const afterDeselect = getSelectedObservations().length;
+        toggleSplit(111);
+        const afterSplit = getSelectedObservations().length;
+        selectAll();
+        const afterSelectAll = getSelectedObservations().length;
+        toggleSplit(111);                       // back to merged
+        console.log(JSON.stringify({
+            afterDeselect, afterSplit, afterSelectAll,
+            mergedAfterSelectAll: getSelectedObservations().length,
+        }));
+    """)
+    assert json.loads(out) == {
+        "afterDeselect": 0,
+        "afterSplit": 0,          # was 3: every split row re-seeded to selected
+        "afterSelectAll": 3,
+        "mergedAfterSelectAll": 1,
+    }
+
+
+def test_splitting_the_narrower_observation_uses_its_own_photo_count(tmp_path):
+    """photos/licenses are padded to max_photos with nulls, so a split must be
+    driven by photo_count, never by photos.length.
+
+    Every earlier fixture splits the widest observation, where the two are equal
+    and the padding is invisible. Here the narrower one is split: iterating
+    photos.length would give observation 222 four rows instead of two, the extra
+    ones exporting null mediaAssets.
+
+    Note the total row count is the WRONG thing to assert here: 3 is correct
+    (1 merged + 2 split) and the padding bug produces 5 (1 merged + 4 padded),
+    so a test written around "5" would enshrine the bug. Assert 222's own
+    contribution instead.
+    """
+    page = build_page(tmp_path, specs=[
+        {"id": 111, "n_photos": 4},
+        {"id": 222, "n_photos": 2},
+    ])
+    out = run_js(page, """
+        const obs222 = observations.find(o => o.observation_id === 222);
+        const fields = (line) => line.split(',');
+        const csvFor = (id) => {
+            const csv = generateCSV(getSelectedObservations()).split('\\n');
+            const header = fields(csv[0]);
+            return {
+                header: header,
+                rows: csv.slice(1).map(fields).filter(r => r[0] === String(id)),
+            };
+        };
+
+        // (a) merged: the padding must not leak into the narrower row's export.
+        const merged = csvFor(222);
+        const mergedRow = merged.rows[0];
+        const mergedPhotoCount = mergedRow[merged.header.indexOf('photo_count')];
+        const mergedFilenames = mergedRow[merged.header.indexOf('photo_filenames')];
+
+        // (b) split the narrower observation.
+        toggleSplit(222);
+        renderObservations();
+        const split = csvFor(222);
+
+        console.log(JSON.stringify({
+            paddedPhotosLength: obs222.photos.length,
+            realPhotoCount: obs222.photo_count,
+            mergedPhotoCount: mergedPhotoCount,
+            mergedFilenames: mergedFilenames,
+            totalRows: displayRows().length,
+            rowsFor222: displayRows().filter(r => r.obs.observation_id === 222).length,
+            renderedRows: __byId['observations-body'].children.length,
+            csvRowsFor222: split.rows.length,
+        }));
+    """)
+    result = json.loads(out)
+    # The fixture really does pad, so the mutation would be observable.
+    assert result["paddedPhotosLength"] == 4 and result["realPhotoCount"] == 2
+    assert result["mergedPhotoCount"] == "2"
+    assert result["mergedFilenames"] == "222_1.jpg; 222_2.jpg"
+    assert result["totalRows"] == 3, "1 merged row for 111 plus 2 split rows for 222"
+    assert result["rowsFor222"] == 2, "the padded nulls became phantom display rows"
+    assert result["renderedRows"] == 3, "the padded nulls became phantom table rows"
+    assert result["csvRowsFor222"] == 2, "phantom rows reached the CSV"
+
+
+def test_split_row_previews_the_photo_it_exports(tmp_path):
+    """all_photo_paths must stay index-aligned with photos.
+
+    Python used to append only paths whose file exists, while photos/licenses
+    stayed aligned to the full photo list. With 111_2.jpg missing, row 2 then
+    previewed 111_3 and exported 111_2 -- showing the reviewer a different photo
+    from the one they are deciding about, in a feature whose whole purpose is
+    deciding per photo.
+    """
+    page = build_page(tmp_path, n_photos=4, missing_photos=[2])
+    out = run_js(page, """
+        const obs = observations[0];
+        toggleSplit(111);
+        renderObservations();
+
+        // Preview shown in each row, in row order (cell 1 is the photo cell).
+        const previews = __byId['observations-body'].children.map(tr => {
+            const cell = tr.children[1].children[0];
+            return cell.className === 'photo-preview' ? cell.src : null;
+        });
+
+        const csv = generateCSV(displayRows()).split('\\n');
+        const assetIdx = csv[0].split(',').indexOf('Encounter.mediaAsset0');
+        const exports = csv.slice(1).map(l => l.split(',')[assetIdx]);
+
+        // The modal must land on the photo the row previews, despite the gaps.
+        const galleryLandings = displayRows().map(r => {
+            const g = galleryFor(r.obs, r.photoIndex);
+            return g.gallery.length ? g.gallery[g.start] : null;
+        });
+
+        console.log(JSON.stringify({
+            aligned: obs.all_photo_paths.length === obs.photo_count,
+            paths: obs.all_photo_paths,
+            previews: previews,
+            exports: exports,
+            galleryLandings: galleryLandings,
+        }));
+    """)
+    result = json.loads(out)
+    assert result["aligned"] is True, "all_photo_paths is not index-aligned with photos"
+    assert result["paths"] == [
+        "photos/111_1.jpg", None, "photos/111_3.jpg", "photos/111_4.jpg"
+    ]
+    # Every row exports all four photos in order...
+    assert result["exports"] == ["111_1.jpg", "111_2.jpg", "111_3.jpg", "111_4.jpg"]
+    # ...and previews either that same photo or nothing -- never a different one.
+    assert result["previews"] == [
+        "photos/111_1.jpg", None, "photos/111_3.jpg", "photos/111_4.jpg"
+    ]
+    for preview, exported in zip(result["previews"], result["exports"]):
+        assert preview in (None, f"photos/{exported}"), (
+            f"row previews {preview} but exports {exported}"
+        )
+    # And clicking a preview opens the gallery on that same photo.
+    for preview, landing in zip(result["previews"], result["galleryLandings"]):
+        if preview is not None:
+            assert landing == preview, f"gallery opened on {landing}, row shows {preview}"
+
+
+def test_flag_mode_respects_the_organism_evidence_suppression(tmp_path):
+    """splitState must be seeded from initially_split, not from the flag.
+
+    Seeding it from socialSplitMode passes every other flag-mode test, and
+    silently discards the "Evidence of Presence: Organism" suppression that is
+    the only reason Python computes initially_split at all.
+    """
+    page = build_page(tmp_path, social_split=True, specs=[
+        {"id": 111, "n_photos": 3},
+        {"id": 222, "n_photos": 3,
+         "annotations": [{"controlled_attribute_id": 22, "controlled_value_id": 24}]},
+    ])
+    out = run_js(page, """
+        console.log(JSON.stringify({
+            seeded: observations.map(o => ({
+                id: o.observation_id, initially: o.initially_split, split: isSplit(o),
+            })),
+            rows: displayRows().length,
+        }));
+    """)
+    result = json.loads(out)
+    assert result["seeded"] == [
+        {"id": 111, "initially": True, "split": True},
+        {"id": 222, "initially": False, "split": False},
+    ], "the organism-evidence observation was split anyway"
+    assert result["rows"] == 4, "3 rows for the split one plus 1 merged"
