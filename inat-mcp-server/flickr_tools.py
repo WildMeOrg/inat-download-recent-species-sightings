@@ -6,16 +6,57 @@ Downloads CC-licensed wildlife photos from Flickr with GPS coordinates
 Matches iNaturalist workflow for Wildbook integration
 """
 
+import csv
 import json
+import math
 import os
-import sys
+import re
+import shutil
 import time
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-import hashlib
+
+# Without an explicit timeout urllib blocks forever on a server that accepts the
+# connection and then goes quiet, wedging the whole MCP server.
+HTTP_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = 120
+
+
+def _json_for_script_block(payload: Any) -> str:
+    """
+    Serialize JSON that is safe to inline inside a <script> element.
+
+    json.dumps does not escape "<", so a value containing "</script>" would
+    close the block early and take every script on the page with it.
+    """
+    return (
+        json.dumps(payload, ensure_ascii=True)
+        .replace('<', '\\u003c')
+        .replace('>', '\\u003e')
+        .replace('&', '\\u0026')
+    )
+
+
+def _safe_float(value: Any, limit: float = None) -> Optional[float]:
+    """
+    Parse an API-supplied coordinate, returning None rather than raising.
+
+    Rejects NaN, infinities and out-of-range values: Flickr has been seen to
+    send "NaN" and nonsense magnitudes, and those would otherwise land in the
+    Wildbook CSV as real GPS data.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if limit is not None and abs(number) > limit:
+        return None
+    return number
 
 
 class FlickrDownloader:
@@ -43,7 +84,8 @@ class FlickrDownloader:
         location_id: str = None,
         submitter_id: str = None,
         api_key: str = None,
-        project_owner: str = None
+        project_owner: str = None,
+        max_results: int = 500
     ):
         """
         Initialize the Flickr downloader.
@@ -58,6 +100,7 @@ class FlickrDownloader:
             submitter_id: Optional submitter ID for Wildbook
             api_key: Flickr API key (or set FLICKR_API_KEY env var)
             project_owner: Optional Wildbook username to own the project
+            max_results: Maximum photos to retrieve per species (default: 500)
         """
         self.output_dir = Path(output_dir)
         self.days_back = days_back
@@ -67,6 +110,7 @@ class FlickrDownloader:
         self.location_id = location_id
         self.submitter_id = submitter_id
         self.project_owner = project_owner
+        self.max_results = max(1, int(max_results))
         self.photos_dir = self.output_dir / "photos"
 
         # Get API key from parameter or environment
@@ -118,17 +162,18 @@ class FlickrDownloader:
             Dictionary with scientific_name, genus, specific_epithet, common_name
             or None if not found
         """
-        # Strip location info if present (e.g., "leopard Tanzania" -> "leopard")
-        # Common location keywords to remove
+        # Strip location info if present (e.g., "leopard Tanzania" -> "leopard").
+        # Whole words only: a plain substring replace turned "Indian elephant"
+        # into "n elephant" and "Bison bison americanus" into "bison bison nus".
         location_keywords = ['tanzania', 'kenya', 'africa', 'serengeti', 'kruger',
                             'madagascar', 'india', 'asia', 'america', 'brazil']
 
         query_lower = species_query.lower()
         for location in location_keywords:
-            query_lower = query_lower.replace(location, '').strip()
+            query_lower = re.sub(rf'\b{re.escape(location)}\b', '', query_lower)
 
-        # Use cleaned query
-        query = query_lower.strip()
+        # Collapse the whitespace the removals left behind
+        query = re.sub(r'\s+', ' ', query_lower).strip()
 
         if not query:
             query = species_query  # Fall back to original if we stripped everything
@@ -163,7 +208,7 @@ class FlickrDownloader:
         url = f"{inat_base}/taxa?{params}"
 
         try:
-            with urllib.request.urlopen(url) as response:
+            with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as response:
                 data = json.loads(response.read().decode())
 
             time.sleep(0.5)  # Rate limiting
@@ -235,7 +280,7 @@ class FlickrDownloader:
             url = f"{self.BASE_URL}?{urllib.parse.urlencode(params)}"
 
             try:
-                with urllib.request.urlopen(url) as response:
+                with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as response:
                     data = json.loads(response.read().decode())
 
                 # Rate limiting
@@ -288,7 +333,7 @@ class FlickrDownloader:
         url = f"{self.BASE_URL}?{urllib.parse.urlencode(params)}"
 
         try:
-            with urllib.request.urlopen(url) as response:
+            with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as response:
                 data = json.loads(response.read().decode())
 
             time.sleep(self.rate_limit)
@@ -316,9 +361,16 @@ class FlickrDownloader:
         if not url:
             return None
 
-        # Generate unique filename
-        photo_id = photo.get('id')
-        extension = url.split('.')[-1].split('?')[0]
+        # Generate unique filename. Take the extension from the URL *path*, so
+        # a query string cannot land in it (or a "/" create a bogus subdirectory).
+        photo_id = str(photo.get('id', ''))
+        if not photo_id.isdigit():
+            print(f"  Skipping photo with unexpected id {photo_id!r}")
+            return None
+
+        extension = Path(urllib.parse.urlparse(url).path).suffix.lstrip('.').lower()
+        if extension not in ('jpg', 'jpeg', 'png', 'gif'):
+            extension = 'jpg'
         filename = f"flickr_{photo_id}.{extension}"
         filepath = self.photos_dir / filename
 
@@ -326,12 +378,19 @@ class FlickrDownloader:
         if filepath.exists():
             return filename
 
+        # Write to a .part file and rename on success so an interrupted
+        # transfer is not cached forever as a complete photo.
+        partial = filepath.with_name(filepath.name + '.part')
         try:
-            urllib.request.urlretrieve(url, filepath)
+            with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response, \
+                    open(partial, 'wb') as out:
+                shutil.copyfileobj(response, out)
+            partial.replace(filepath)
             time.sleep(self.rate_limit * 0.5)  # Lighter rate limit for downloads
             return filename
         except Exception as e:
             print(f"  Error downloading photo {photo_id}: {e}")
+            partial.unlink(missing_ok=True)
             return None
 
     def process_observations(self, species_name: str, max_results: int = 500) -> List[Dict[str, Any]]:
@@ -379,23 +438,25 @@ class FlickrDownloader:
             if not photo_info:
                 photo_info = photo
 
-            # Extract date (prefer date taken, fall back to upload date)
+            # Extract the capture date. Leave it blank when Flickr does not
+            # know it (missing, or the "0000-00-00 00:00:00" sentinel): dating
+            # an old photo to today would fabricate a sighting that is
+            # indistinguishable from a real one in Wildbook.
+            observed_on, year, month, day = '', '', '', ''
             date_taken = photo.get('datetaken')
             if date_taken:
                 try:
                     dt = datetime.strptime(date_taken, '%Y-%m-%d %H:%M:%S')
                     observed_on = dt.strftime('%Y-%m-%d')
                     year, month, day = dt.year, dt.month, dt.day
-                except:
-                    observed_on = datetime.now().strftime('%Y-%m-%d')
-                    year, month, day = datetime.now().year, datetime.now().month, datetime.now().day
-            else:
-                observed_on = datetime.now().strftime('%Y-%m-%d')
-                year, month, day = datetime.now().year, datetime.now().month, datetime.now().day
+                except ValueError:
+                    print(f"  Warning: unparsable datetaken {date_taken!r} for photo "
+                          f"{photo.get('id')}; leaving the observation date blank")
 
-            # Extract GPS coordinates
-            latitude = float(photo.get('latitude', 0))
-            longitude = float(photo.get('longitude', 0))
+            # Extract GPS coordinates. Flickr returns these as strings and can
+            # send an empty one, which float() rejects.
+            latitude = _safe_float(photo.get('latitude'), limit=90)
+            longitude = _safe_float(photo.get('longitude'), limit=180)
 
             # Extract description from detailed photo info
             description = ''
@@ -486,7 +547,7 @@ class FlickrDownloader:
         all_observations = []
 
         for species in self.species_list:
-            obs = self.process_observations(species)
+            obs = self.process_observations(species, max_results=self.max_results)
             all_observations.extend(obs)
 
         if not all_observations:
@@ -601,10 +662,24 @@ class FlickrDownloader:
 
     def _generate_html_template(self, observations: List[Dict]) -> str:
         """Generate HTML template matching iNaturalist style."""
-        observations_json_str = json.dumps(observations, indent=2)
+        # Flickr free text (titles, descriptions, owner names) reaches this page
+        # verbatim. json.dumps does not escape "<", so an unescaped "</script>"
+        # in a photo description would close the block early and blank the page.
+        observations_json_str = (
+            json.dumps(observations, indent=2, ensure_ascii=True)
+            .replace('<', '\\u003c')
+            .replace('>', '\\u003e')
+            .replace('&', '\\u0026')
+        )
 
+        # Species names can contain apostrophes ("Cooper's hawk"), which would
+        # terminate the JS string literal this lands in and kill every script on
+        # the page, so emit it as JSON.
         species_part = "_".join([s.replace(" ", "-") for s in self.species_list[:2]])
         date_part = datetime.now().strftime("%Y%m%d")
+        csv_filename_js = _json_for_script_block(
+            f"flickr_observations_{species_part}_{date_part}.csv"
+        )
 
         return f'''<!DOCTYPE html>
 <html lang="en">
@@ -931,25 +1006,71 @@ class FlickrDownloader:
             observations.forEach((obs, index) => {{
                 const row = document.createElement('tr');
 
-                const photoPreview = obs.photo_path ?
-                    `<img src="${{obs.photo_path}}" class="photo-preview" onclick="showImage('${{obs.photo_path}}')" alt="Preview">` :
-                    'No photo';
+                // Cells are built with textContent, not innerHTML: Flickr
+                // titles, descriptions, owner names and localities are
+                // untrusted and would otherwise execute in this page.
+                const cell = (node) => {{
+                    const td = document.createElement('td');
+                    if (node !== null && node !== undefined) td.appendChild(node);
+                    return td;
+                }};
+                const textCell = (value, fallback) => {{
+                    const td = document.createElement('td');
+                    td.textContent = (value === null || value === undefined || value === '')
+                        ? fallback : String(value);
+                    return td;
+                }};
 
-                const coords = obs.latitude && obs.longitude ?
-                    `${{parseFloat(obs.latitude).toFixed(6)}}, ${{parseFloat(obs.longitude).toFixed(6)}}` :
-                    'No GPS';
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.className = 'obs-checkbox';
+                checkbox.dataset.index = index;
+                checkbox.checked = true;
+                checkbox.addEventListener('change', updateCount);
+                row.appendChild(cell(checkbox));
 
-                row.innerHTML = `
-                    <td><input type="checkbox" class="obs-checkbox" data-index="${{index}}" checked onchange="updateCount()"></td>
-                    <td>${{photoPreview}}</td>
-                    <td>${{obs.observed_on || 'Unknown'}}</td>
-                    <td><em>${{obs.scientific_name || obs.common_name}}</em></td>
-                    <td>${{obs.location || 'Unknown'}}</td>
-                    <td>${{coords}}</td>
-                    <td>${{obs.observer || 'Unknown'}}</td>
-                    <td><span class="license-badge">${{obs.license_display}}</span></td>
-                    <td><a href="${{obs.url}}" target="_blank">View</a></td>
-                `;
+                if (obs.photo_path) {{
+                    const img = document.createElement('img');
+                    img.src = obs.photo_path;
+                    img.className = 'photo-preview';
+                    img.alt = 'Preview';
+                    img.addEventListener('click', () => showImage(obs.photo_path));
+                    row.appendChild(cell(img));
+                }} else {{
+                    row.appendChild(textCell(null, 'No photo'));
+                }}
+
+                row.appendChild(textCell(obs.observed_on, 'Unknown'));
+
+                const speciesEm = document.createElement('em');
+                speciesEm.textContent = obs.scientific_name || obs.common_name || 'Unknown';
+                row.appendChild(cell(speciesEm));
+
+                row.appendChild(textCell(obs.location, 'Unknown'));
+
+                // Compare against null explicitly: a sighting on the equator or
+                // prime meridian has a legitimate coordinate of 0.
+                const hasCoords = obs.latitude !== null && obs.latitude !== undefined && obs.latitude !== ''
+                               && obs.longitude !== null && obs.longitude !== undefined && obs.longitude !== '';
+                row.appendChild(textCell(
+                    hasCoords ? `${{parseFloat(obs.latitude).toFixed(6)}}, ${{parseFloat(obs.longitude).toFixed(6)}}` : null,
+                    'No GPS'));
+
+                row.appendChild(textCell(obs.observer, 'Unknown'));
+
+                const badge = document.createElement('span');
+                badge.className = 'license-badge';
+                badge.textContent = obs.license_display || 'Unknown';
+                row.appendChild(cell(badge));
+
+                const link = document.createElement('a');
+                // Only follow http(s) links; never javascript: from API data.
+                const rawUrl = String(obs.url || '');
+                link.href = (rawUrl.startsWith('http://') || rawUrl.startsWith('https://')) ? rawUrl : '#';
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                link.textContent = 'View';
+                row.appendChild(cell(link));
 
                 tbody.appendChild(row);
             }});
@@ -1002,13 +1123,21 @@ class FlickrDownloader:
             let csv = 'observation_id,observed_on,Encounter.year,Encounter.month,Encounter.day,';
             csv += 'scientific_name,Encounter.genus,Encounter.specificEpithet,common_name,';
             csv += 'Encounter.decimalLatitude,Encounter.decimalLongitude,Encounter.verbatimLocality,';
-            csv += 'Encounter.locationID,Encounter.livingStatus,Encounter.submitterID,';
+            csv += 'Encounter.locationID,Encounter.livingStatus,Encounter.submitterID,Encounter.state,';
             csv += 'Encounter.project0.researchProjectName,Encounter.project0.ownerUsername,';
             csv += 'Sighting.sightingID,Encounter.sightingRemarks,observer,quality_grade,url,Encounter.researcherComments,';
             csv += 'Encounter.mediaAsset0,Encounter.mediaAsset0.license\\n';
 
             selected.forEach(obs => {{
-                const escape = (str) => `"${{(str || '').toString().replace(/"/g, '""')}}"`;
+                const escape = (value) => {{
+                    let str = String(value === null || value === undefined ? '' : value);
+                    // Neutralise spreadsheet formula injection from Flickr text,
+                    // but leave genuine negative numbers (latitudes) alone.
+                    if (/^[=+\\-@\\t\\r]/.test(str) && !/^-?\\d*\\.?\\d+$/.test(str)) {{
+                        str = "'" + str;
+                    }}
+                    return '"' + str.replace(/"/g, '""') + '"';
+                }};
 
                 // Get photo filename and license from photo list
                 const photoList = obs._photo_list || [];
@@ -1032,6 +1161,7 @@ class FlickrDownloader:
                     escape(obs.location_id),
                     escape(obs.living_status),
                     escape(obs.submitter_id),
+                    escape('unapproved'),  // Encounter.state - always unapproved
                     escape(obs.project_name),
                     escape(obs.project_owner),
                     escape(obs.sighting_id),
@@ -1055,7 +1185,7 @@ class FlickrDownloader:
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = 'flickr_observations_{species_part}_{date_part}.csv';
+            a.download = {csv_filename_js};
             a.click();
             window.URL.revokeObjectURL(url);
         }}
@@ -1066,10 +1196,77 @@ class FlickrDownloader:
 </body>
 </html>'''
 
+    # Column order for the Wildbook bulk import, matching the browser-side
+    # export in write_html().
+    CSV_FIELDNAMES = [
+        'observation_id',
+        'observed_on',
+        'Encounter.year',
+        'Encounter.month',
+        'Encounter.day',
+        'scientific_name',
+        'Encounter.genus',
+        'Encounter.specificEpithet',
+        'common_name',
+        'Encounter.decimalLatitude',
+        'Encounter.decimalLongitude',
+        'Encounter.verbatimLocality',
+        'Encounter.locationID',
+        'Encounter.livingStatus',
+        'Encounter.submitterID',
+        'Encounter.state',
+        'Encounter.project0.researchProjectName',
+        'Encounter.project0.ownerUsername',
+        'Sighting.sightingID',
+        'Encounter.sightingRemarks',
+        'observer',
+        'quality_grade',
+        'url',
+        'Encounter.researcherComments',
+    ]
+
     def write_csv(self, data: List[Dict[str, Any]], filename: str):
-        """Write observations to CSV in Wildbook format (fallback if no HTML)."""
-        # This would implement CSV writing - simplified for now
-        pass
+        """
+        Write observations to CSV in Wildbook bulk-import format.
+
+        Args:
+            data: Processed observation rows
+            filename: CSV filename, created inside the output directory
+        """
+        csv_path = self.output_dir / filename
+
+        max_photos = max((len(row.get('_photo_list', [])) for row in data), default=0)
+
+        fieldnames = list(self.CSV_FIELDNAMES)
+        for i in range(max_photos):
+            fieldnames.append(f'Encounter.mediaAsset{i}')
+            fieldnames.append(f'Encounter.mediaAsset{i}.license')
+
+        export_rows = []
+        for row in data:
+            photo_list = row.get('_photo_list', [])
+            license_list = row.get('_license_list', [])
+            export_row = {
+                field: row.get(field, '') for field in self.CSV_FIELDNAMES
+            }
+            # Wildbook requires new encounters to land unapproved for review.
+            export_row['Encounter.state'] = 'unapproved'
+            for i in range(max_photos):
+                export_row[f'Encounter.mediaAsset{i}'] = (
+                    photo_list[i] if i < len(photo_list) else None
+                )
+                export_row[f'Encounter.mediaAsset{i}.license'] = (
+                    license_list[i] if i < len(license_list) else None
+                )
+            export_rows.append(export_row)
+
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(export_rows)
+
+        print(f"\nCSV file written: {csv_path}")
+        print(f"Total observations: {len(export_rows)}")
 
 
 if __name__ == "__main__":
