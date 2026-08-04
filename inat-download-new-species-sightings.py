@@ -837,6 +837,16 @@ class iNaturalistDownloader:
                 for i in range(len(photo_list))
             )
 
+            # Per-photo licence flags. A split row only exports its own photo, so
+            # it can be selected on that photo's licence alone -- which lets
+            # splitting rescue the licensed photos from an observation that is
+            # deselected wholesale under the all-or-nothing rule.
+            photo_licensed = [
+                bool(license_list[i]) if i < len(license_list) else False
+                for i in range(len(photo_list))
+            ]
+            photo_licensed += [False] * (max_photos - len(photo_licensed))
+
             # Build observation object
             obs_data = {
                 'observation_id': row.get('observation_id'),
@@ -856,7 +866,9 @@ class iNaturalistDownloader:
                 'submitter_id': row.get('Encounter.submitterID'),
                 'project_name': row.get('Encounter.project0.researchProjectName'),
                 'project_owner': row.get('Encounter.project0.ownerUsername'),
-                'sighting_id': row.get('Sighting.sightingID'),
+                'sighting_id': row.get('_sighting_id'),
+                'initially_split': bool(row.get('_split_eligible')) and len(photo_list) > 1,
+                'photo_licensed': photo_licensed,
                 'observer': row.get('observer'),
                 'quality_grade': row.get('quality_grade'),
                 'url': row.get('url'),

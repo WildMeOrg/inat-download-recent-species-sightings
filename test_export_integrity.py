@@ -318,6 +318,42 @@ def test_split_rows_by_photo_preserves_per_photo_license_alignment():
         assert [row[idx] for row in data_rows] == licenses
 
 
+def _payload(html):
+    """Pull the observations array out of a generated review page."""
+    match = re.search(r"const observations = (\[.*?\]);\n", html, re.S)
+    assert match, "observations payload not found"
+    return json.loads(match.group(1))
+
+
+def test_payload_carries_split_state_and_per_photo_licences():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _downloader(tmp, social_split=True)
+        obs = _obs(n_photos=3)
+        obs["photos"][1]["license_code"] = ""          # middle photo unlicensed
+        rows = d.process_observations([obs], "Panthera onca")
+        for i in range(1, 4):
+            (Path(tmp) / "photos" / f"111_{i}.jpg").write_bytes(b"x")
+        d.write_html(rows, "review.html")
+
+        entry = _payload((Path(tmp) / "review.html").read_text(encoding="utf-8"))[0]
+
+        assert entry["sighting_id"], "browser has no sighting id to promote"
+        assert entry["initially_split"] is True
+        assert entry["photo_licensed"] == [True, False, True]
+        # The all-or-nothing flag stays for merged rows.
+        assert entry["all_media_licensed"] is False
+
+
+def test_payload_split_state_is_false_without_the_flag():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _downloader(tmp, social_split=False)
+        rows = d.process_observations([_obs(n_photos=3)], "Panthera onca")
+        d.write_html(rows, "review.html")
+        entry = _payload((Path(tmp) / "review.html").read_text(encoding="utf-8"))[0]
+        assert entry["initially_split"] is False
+        assert entry["sighting_id"], "a sighting id is still needed for manual splits"
+
+
 def test_split_rows_by_photo_is_pure():
     """It must not mutate its input; run() relies on that for the HTML path.
 
