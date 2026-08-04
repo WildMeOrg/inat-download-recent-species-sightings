@@ -337,7 +337,9 @@ def test_payload_carries_split_state_and_per_photo_licences():
 
         entry = _payload((Path(tmp) / "review.html").read_text(encoding="utf-8"))[0]
 
-        assert entry["sighting_id"], "browser has no sighting id to promote"
+        assert entry["sighting_id"] == rows[0]["_sighting_id"], (
+            "browser has no sighting id to promote"
+        )
         assert entry["initially_split"] is True
         assert entry["photo_licensed"] == [True, False, True]
         # The all-or-nothing flag stays for merged rows.
@@ -351,7 +353,58 @@ def test_payload_split_state_is_false_without_the_flag():
         d.write_html(rows, "review.html")
         entry = _payload((Path(tmp) / "review.html").read_text(encoding="utf-8"))[0]
         assert entry["initially_split"] is False
-        assert entry["sighting_id"], "a sighting id is still needed for manual splits"
+        assert entry["sighting_id"] == rows[0]["_sighting_id"], (
+            "a sighting id is still needed for manual splits"
+        )
+
+
+def test_payload_split_state_is_false_for_a_single_photo_even_with_the_flag():
+    """Literal requirement: single photo + --social-split-observations on must
+    still report initially_split is False -- correct by construction via the
+    len(photo_list) > 1 guard, but nothing exercised it against write_html's
+    actual output until now."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _downloader(tmp, social_split=True)
+        rows = d.process_observations([_obs(n_photos=1)], "Panthera onca")
+        d.write_html(rows, "review.html")
+        entry = _payload((Path(tmp) / "review.html").read_text(encoding="utf-8"))[0]
+        assert entry["initially_split"] is False
+        assert entry["sighting_id"] == rows[0]["_sighting_id"]
+
+
+def test_payload_photo_licensed_is_padded_to_max_photos_across_observations():
+    """photo_licensed must be padded per-observation to the run's max_photos,
+    not to that observation's own photo count -- a later task pairs
+    photo_licensed with photos/licenses by index, so a short array would
+    silently shift which photo is considered licensed.
+
+    Two observations with different photo counts force max_photos (4) above
+    the smaller observation's own count (2), so padding is the only thing
+    that can make the arrays line up.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _downloader(tmp, social_split=False)
+        obs_a = _obs(obs_id=111, n_photos=4)
+        obs_b = _obs(obs_id=222, n_photos=2)
+        rows = d.process_observations([obs_a], "Panthera onca")
+        rows += d.process_observations([obs_b], "Panthera onca")
+        d.write_html(rows, "review.html")
+
+        entries = _payload((Path(tmp) / "review.html").read_text(encoding="utf-8"))
+        entry_b = next(e for e in entries if e["observation_id"] == 222)
+
+        assert len(entry_b["photo_licensed"]) == 4, (
+            "photo_licensed was padded to this observation's own photo count "
+            "(2), not the run's max_photos (4)"
+        )
+        assert entry_b["photo_licensed"][2:] == [False, False], (
+            "padding tail is not all False"
+        )
+        assert (
+            len(entry_b["photo_licensed"])
+            == len(entry_b["photos"])
+            == len(entry_b["licenses"])
+        ), "photo_licensed, photos and licenses must stay index-aligned"
 
 
 def test_split_rows_by_photo_is_pure():
