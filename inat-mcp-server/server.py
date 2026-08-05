@@ -34,6 +34,7 @@ inat_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(inat_module)
 iNaturalistDownloader = inat_module.iNaturalistDownloader
 fetch_json = inat_module.fetch_json
+split_rows_by_photo = inat_module.split_rows_by_photo
 
 # Import YouTube tools
 from youtube_tools import YouTubeSearcher, format_video_results, generate_html_report
@@ -436,6 +437,15 @@ async def download_observations_tool(args: dict[str, Any]) -> list[types.TextCon
                 f"✓ Species '{species_name}': {len(observations)} observations downloaded"
             )
 
+        # This tool duplicates run()'s orchestration, so it has to duplicate both
+        # of run()'s post-processing steps too -- keep the two in step.
+        #
+        # Deduplication: several species names can resolve to one taxon, and
+        # without this the same observation becomes several Wildbook Encounters
+        # carrying the same Encounter.otherCatalogNumbers and the same media.
+        if all_observations_data:
+            all_observations_data = downloader.deduplicate_rows(all_observations_data)
+
         # Generate output
         if all_observations_data:
             from datetime import datetime
@@ -452,8 +462,15 @@ async def download_observations_tool(args: dict[str, Any]) -> list[types.TextCon
                 downloader.write_html(all_observations_data, html_filename)
                 output_files.append(f"HTML review: {output_dir}/{html_filename}")
             else:
+                # Splitting used to happen inside process_observations(); it is
+                # now a separate pass on the direct-CSV path only (the HTML page
+                # does its own splitting in the browser). Without this call the
+                # social_split argument this tool advertises is a silent no-op.
+                csv_rows = all_observations_data
+                if social_split:
+                    csv_rows = split_rows_by_photo(csv_rows)
                 csv_filename = f"inat_observations_{species_part}{place_part}_{timestamp}.csv"
-                downloader.write_csv(all_observations_data, csv_filename)
+                downloader.write_csv(csv_rows, csv_filename)
                 output_files.append(f"CSV export: {output_dir}/{csv_filename}")
 
             output_files.append(f"Photos directory: {downloader.photos_dir}")

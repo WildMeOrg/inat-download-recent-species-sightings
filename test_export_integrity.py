@@ -279,6 +279,72 @@ def test_neutralize_formula_matches_the_browser_rule():
     assert mod.neutralize_formula(111) == 111
 
 
+def _mcp_download_handler():
+    """The MCP server's own copy of run()'s orchestration, as an AST.
+
+    Parsed rather than imported: the `mcp` package is not a test dependency, and
+    server.py imports it at module scope. ast.parse needs neither.
+    """
+    source = (Path(__file__).parent / "inat-mcp-server" / "server.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for call in ast.walk(node):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "write_csv"
+                and "inat_observations_" in ast.dump(node)
+            ):
+                return node
+    raise AssertionError("no MCP handler writing the iNaturalist CSV was found")
+
+
+def test_the_mcp_server_applies_the_same_post_processing_as_the_cli():
+    """server.py duplicates run()'s orchestration and must not fall behind it.
+
+    Splitting used to happen inside process_observations, so the MCP tool got it
+    for free. Moving splitting to a separate pass on the direct-CSV path left
+    the MCP tool advertising a social_split argument that did nothing at all --
+    a silently disabled feature, which is worse than a missing one. The same
+    copy also never deduplicated, so two species names resolving to one taxon
+    produced duplicate Encounters there while the CLI dropped them.
+    """
+    handler = _mcp_download_handler()
+
+    called = {
+        node.func.id
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    } | {
+        node.func.attr
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+    assert "deduplicate_rows" in called, (
+        "the MCP download tool never deduplicates, so one observation reached "
+        "Wildbook once per species alias that resolved to it"
+    )
+    assert "split_rows_by_photo" in called, (
+        "the MCP download tool's social_split argument is a no-op: splitting is "
+        "no longer done by process_observations and nothing else applies it"
+    )
+
+    # And the split is conditional, not unconditional: it must be gated on the
+    # tool's social_split argument exactly as run() gates it on self.social_split.
+    guarded = any(
+        "social_split" in ast.dump(branch.test)
+        and "split_rows_by_photo" in ast.dump(ast.Module(body=branch.body, type_ignores=[]))
+        for branch in ast.walk(handler)
+        if isinstance(branch, ast.If)
+    )
+    assert guarded, "split_rows_by_photo is applied without checking social_split"
+
+
 def test_csv_header_has_no_internal_fields():
     """The Wildbook import CSV must not carry our underscore-prefixed flags."""
     with tempfile.TemporaryDirectory() as tmp:
