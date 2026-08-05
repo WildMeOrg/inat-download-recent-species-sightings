@@ -820,13 +820,22 @@ class iNaturalistDownloader:
 
             # Displayable path per photo, or None when the download failed.
             #
-            # INVARIANT: len(all_photo_paths) == len(photo_list), so this list is
-            # index-aligned with _photo_list, photos, licenses and photo_licensed.
-            # A missing file MUST become None rather than be dropped: a split row
-            # previews all_photo_paths[i] and exports photos[i], so compacting
-            # this list would shift every later row's preview and show the
-            # reviewer a different photo from the one they are deciding about.
-            # The gallery skips the Nones instead (see galleryFor() in the page).
+            # INVARIANT: len(all_photo_paths) == len(photo_list). A missing file
+            # MUST become None rather than be dropped: a split row previews
+            # all_photo_paths[i] and exports photos[i], so compacting this list
+            # would shift every later row's preview and show the reviewer a
+            # different photo from the one they are deciding about. The gallery
+            # skips the Nones instead (see galleryFor() in the page).
+            #
+            # Note this list is sized to photo_list, NOT padded to max_photos the
+            # way photos / licenses / photo_licensed are, and that asymmetry is
+            # deliberate rather than an oversight. Those three are padded because
+            # the CSV writer walks a fixed column count that spans every row on
+            # the page. Nothing walks all_photo_paths that way: it is only ever
+            # indexed by a photoIndex already known to be < photo_count, so
+            # padding it would add slots no code path can reach. Index alignment
+            # with photo_list is the invariant that matters; equal length with
+            # photos is not.
             all_photo_paths = [
                 f"photos/{photo_filename}"
                 if (self.photos_dir / photo_filename).exists() else None
@@ -1562,6 +1571,12 @@ class iNaturalistDownloader:
 
                 indices.forEach(photoIndex => {{
                     const tr = document.createElement('tr');
+                    // Which observation this rendered row belongs to. Lets a
+                    // reader (and a test) see grouping in the table itself
+                    // rather than inferring it from the data model, which is
+                    // observation-ordered by construction and so cannot show
+                    // whether sorting scattered a split group.
+                    tr.setAttribute('data-observation-id', obs.observation_id);
                     if (split) tr.classList.add(groupClass);
                     renderRow(tr, obs, photoIndex);
                     tbody.appendChild(tr);
@@ -1946,14 +1961,34 @@ class iNaturalistDownloader:
             return str;
         }}
 
+        function flashCopyStatus(message) {{
+            const success = document.getElementById('copy-success');
+            success.textContent = message;
+            success.classList.add('show');
+            setTimeout(() => {{
+                success.classList.remove('show');
+            }}, 5000);
+        }}
+
         function copyCSV() {{
             const csv = document.getElementById('csv-output').textContent;
-            navigator.clipboard.writeText(csv).then(() => {{
-                const success = document.getElementById('copy-success');
-                success.classList.add('show');
-                setTimeout(() => {{
-                    success.classList.remove('show');
-                }}, 3000);
+
+            // This page is opened over file://, where the Clipboard API is
+            // frequently missing or blocked outright. Feature-detect and catch
+            // the rejection: without both, the reviewer got a TypeError or a
+            // silent unhandled rejection and no feedback at all.
+            const clipboard = navigator.clipboard;
+            if (!clipboard || typeof clipboard.writeText !== 'function') {{
+                flashCopyStatus('Clipboard is unavailable in this browser context. '
+                    + 'Use "Download CSV File" instead.');
+                return;
+            }}
+
+            clipboard.writeText(csv).then(() => {{
+                flashCopyStatus('CSV content copied to clipboard!');
+            }}).catch(() => {{
+                flashCopyStatus('The browser blocked clipboard access. '
+                    + 'Use "Download CSV File" instead.');
             }});
         }}
 

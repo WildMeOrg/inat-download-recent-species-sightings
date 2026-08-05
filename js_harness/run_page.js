@@ -88,19 +88,44 @@ function makeElement(tag) {
 }
 
 const byId = {};
+
+// Document-level listeners are RETAINED, not discarded. The page does all of its
+// initialization in a DOMContentLoaded handler, so a no-op addEventListener here
+// would mean the whole bootstrap -- the first render, the stats, the initial CSV
+// -- is never executed by any test, and "the page opens blank" would be
+// invisible. Tests fire it with `document.dispatch('DOMContentLoaded')`.
+const docListeners = {};
+const documentStub = {
+  getElementById: id => (byId[id] = byId[id] || makeElement('div')),
+  createElement: makeElement,
+  addEventListener(type, handler) {
+    (docListeners[type] = docListeners[type] || []).push(handler);
+  },
+  removeEventListener(type, handler) {
+    if (!docListeners[type]) return;
+    docListeners[type] = docListeners[type].filter(h => h !== handler);
+  },
+  // Test hook, not a real DOM API.
+  dispatch(type, event) {
+    (docListeners[type] || []).forEach(h =>
+      h.call(documentStub, event || { type: type, target: documentStub }));
+  },
+  querySelectorAll: selector => queryAll(selector),
+};
+
 const sandbox = {
   console,
-  document: {
-    getElementById: id => (byId[id] = byId[id] || makeElement('div')),
-    createElement: makeElement,
-    addEventListener() {},
-    querySelectorAll: selector => queryAll(selector),
-  },
+  document: documentStub,
   navigator: { clipboard: { writeText: () => Promise.resolve() } },
   alert: () => {},
+  // The page uses setTimeout only to hide a transient banner. Run nothing: a
+  // test that wants to observe the banner needs it still showing.
+  setTimeout: () => 0,
+  clearTimeout: () => {},
   // Exposed so assertions can inspect what was rendered.
   __created: created,
   __byId: byId,
+  __docListeners: docListeners,
 };
 vm.createContext(sandbox);
 

@@ -7,7 +7,9 @@ stubbed DOM so the real functions can be called directly. Tests skip when node
 is not installed rather than failing.
 """
 
+import csv
 import importlib.util
+import io
 import json
 import re
 import shutil
@@ -62,6 +64,11 @@ def build_page(tmp_path, n_photos=4, social_split=False, licenses=None, specs=No
     that index of all_photo_paths, which is what keeps previews aligned with
     exports; a test needs this to prove a split row previews the photo it
     exports rather than a later one.
+
+    "place_guess" / "common_name" -- override the benign defaults. Real
+    iNaturalist localities look like "Pocone, BR-MT, BR" (see update_states.py),
+    and the defaults here contain no comma, quote or newline, so a CSV-quoting
+    test needs to supply its own hostile values.
     """
     if specs is None:
         specs = [{"id": 111, "n_photos": n_photos, "licenses": licenses,
@@ -80,9 +87,12 @@ def build_page(tmp_path, n_photos=4, social_split=False, licenses=None, specs=No
             photos.append({"url": "https://example.test/a/square.jpg", "license_code": code})
         payload = {
             "id": obs_id,
-            "taxon": {"name": "Panthera onca", "preferred_common_name": "Jaguar"},
+            "taxon": {
+                "name": "Panthera onca",
+                "preferred_common_name": spec.get("common_name", "Jaguar"),
+            },
             "observed_on": "2026-07-01",
-            "place_guess": "Pantanal",
+            "place_guess": spec.get("place_guess", "Pantanal"),
             "photos": photos,
         }
         if spec.get("annotations"):
@@ -308,13 +318,17 @@ def test_merged_row_sighting_id_depends_on_the_flag(tmp_path):
 
 
 def test_split_rows_stay_adjacent_after_sorting(tmp_path):
-    """Needs MORE THAN ONE observation, or it proves nothing.
+    """Asserts on the RENDERED table, not on displayRows().
 
-    Sorting ranks observations and then expands their photos. With a single
-    observation every row trivially belongs to it, so the assertion cannot fail
-    however broken the sort is. Two observations, one split and one not, with the
-    split one's first photo deselected so the sort actually has work to do, is
-    the smallest fixture that can detect scattering.
+    displayRows() walks `observations` in payload order, so it is grouped by
+    observation *by construction* and cannot show whether sorting scattered a
+    split group -- an earlier version of this test read it and therefore could
+    not fail. Sorting individual display rows by selection instead of ranking
+    observations renders 111, 111, 222, 111 in the real table while leaving
+    displayRows() untouched.
+
+    Needs MORE THAN ONE observation, and needs one photo of the split one
+    deselected, or selected-first sorting has no reason to move anything.
     """
     page = build_page(tmp_path, specs=[
         {"id": 111, "n_photos": 3},
@@ -325,9 +339,15 @@ def test_split_rows_stay_adjacent_after_sorting(tmp_path):
         // Deselect one photo of 111 so selected-first sorting has a reason to move rows.
         selectionState.set(rowKey(observations.find(o => o.observation_id === 111), 0), false);
         renderObservations();
-        console.log(JSON.stringify(displayRows().map(r => r.obs.observation_id)));
+        console.log(JSON.stringify({
+            rendered: __byId['observations-body'].children.map(
+                tr => Number(tr.getAttribute('data-observation-id'))),
+            model: displayRows().map(r => r.obs.observation_id),
+        }));
     """)
-    ids = json.loads(out)
+    result = json.loads(out)
+    ids = result["rendered"]
+    assert ids, "no rows were rendered, so the assertion would be vacuous"
 
     # Every run of a given id must be contiguous: no id may reappear after a
     # different id has intervened.
@@ -341,6 +361,11 @@ def test_split_rows_stay_adjacent_after_sorting(tmp_path):
     # And the split observation really did expand, so the fixture is exercising it.
     assert ids.count(111) == 3, ids
     assert ids.count(222) == 1, ids
+    # The rendered table and the model must describe the same set of rows, so a
+    # sort cannot quietly drop or duplicate one.
+    assert sorted(ids) == sorted(result["model"]), (
+        f"rendered rows {ids} do not match the model {result['model']}"
+    )
 
 
 def test_split_row_is_selected_on_its_own_licence(tmp_path):
@@ -517,6 +542,146 @@ def test_splitting_the_narrower_observation_uses_its_own_photo_count(tmp_path):
     assert result["rowsFor222"] == 2, "the padded nulls became phantom display rows"
     assert result["renderedRows"] == 3, "the padded nulls became phantom table rows"
     assert result["csvRowsFor222"] == 2, "phantom rows reached the CSV"
+
+
+def test_dom_content_loaded_bootstrap_renders_the_page(tmp_path):
+    """The page does ALL of its initialization in a DOMContentLoaded handler.
+
+    The harness used to give the document a no-op addEventListener, which threw
+    that handler away -- so every other test calls renderObservations() itself
+    and none of them exercises the bootstrap. Deleting renderObservations() from
+    it would ship a page that opens with an empty table, and the suite would stay
+    green. This test fires the real event and asserts the page came up.
+    """
+    page = build_page(tmp_path, n_photos=4)
+    out = run_js(page, """
+        // Nothing has run yet: no test-side render, no manual updateCSV. Go
+        // through getElementById, not __byId -- the stub creates elements on
+        // first lookup, and the page has not looked any of these up yet.
+        const body = document.getElementById('observations-body');
+        const output = document.getElementById('csv-output');
+        const before = {
+            rows: body.children.length,
+            csv: output.textContent,
+            total: document.getElementById('total-count').textContent,
+        };
+        if (!(__docListeners['DOMContentLoaded'] || []).length) {
+            throw new Error('the page registered no DOMContentLoaded handler');
+        }
+        document.dispatch('DOMContentLoaded');
+
+        const csv = __byId['csv-output'].textContent;
+        console.log(JSON.stringify({
+            before: before,
+            rows: __byId['observations-body'].children.length,
+            total: __byId['total-count'].textContent,
+            selected: __byId['selected-count'].textContent,
+            obscured: __byId['obscured-count'].textContent,
+            splitHeader: __byId['split-header'].style.display,
+            csvHeaderStarts: csv.split('\\n')[0].slice(0, 15),
+            csvDataRows: csv.split('\\n').length - 1,
+        }));
+    """)
+    result = json.loads(out)
+    # Prove the bootstrap did the work, not something that had already run.
+    assert result["before"] == {"rows": 0, "csv": "", "total": ""}
+    assert result["rows"] == 1, "the table is empty after DOMContentLoaded"
+    assert result["total"] == "1"
+    assert result["selected"] == "1"
+    assert result["obscured"] == "0"
+    assert result["splitHeader"] == "", "the Split column was never revealed on load"
+    assert result["csvHeaderStarts"] == "observation_id,", "the CSV pane is not populated"
+    assert result["csvDataRows"] == 1
+
+
+def test_browser_export_quotes_commas_quotes_and_newlines(tmp_path):
+    """Parses the exported CSV with a real parser, not by splitting on commas.
+
+    Every other JS fixture uses values like `Pantanal` and `cc-by`, so making
+    escapeCSV() return its input unchanged leaves the suite green. Real
+    iNaturalist localities carry commas -- update_states.py is full of
+    "Pocone, BR-MT, BR" -- and one of those in place_guess would shift every
+    later field of the exported row, silently corrupting the Wildbook import.
+    """
+    locality = 'Poconé, BR-MT, BR'
+    common = 'Jaguar "El Jefe"\nsecond line'
+    page = build_page(tmp_path, specs=[
+        {"id": 111, "n_photos": 2, "place_guess": locality, "common_name": common},
+    ])
+    out = run_js(page, "console.log(generateCSV(getSelectedObservations()));")
+
+    rows = list(csv.reader(io.StringIO(out)))
+    header, data = rows[0], rows[1:]
+    assert len(data) == 1, f"expected one data row, parsed {len(data)}"
+    assert len(data[0]) == len(header), (
+        f"row has {len(data[0])} fields but the header has {len(header)} -- "
+        "an unquoted delimiter shifted the row"
+    )
+    record = dict(zip(header, data[0]))
+    assert record["Encounter.verbatimLocality"] == locality
+    assert record["common_name"] == common
+    # Unrelated fields must be untouched by the quoting.
+    assert record["observation_id"] == "111"
+    assert record["scientific_name"] == "Panthera onca"
+    assert record["Encounter.mediaAsset0"] == "111_1.jpg"
+    assert record["Encounter.mediaAsset1"] == "111_2.jpg"
+    assert record["photo_filenames"] == "111_1.jpg; 111_2.jpg"
+
+
+def test_copy_csv_reports_failure_instead_of_throwing(tmp_path):
+    """Over file:// the Clipboard API is often missing or blocked.
+
+    With no feature detection the reviewer got a TypeError, and with no .catch()
+    an unhandled rejection -- either way no feedback. Note the rejection half of
+    this test also fails if .catch() is removed, because an unhandled rejection
+    exits node non-zero and run_js treats that as a harness failure.
+    """
+    page = build_page(tmp_path, n_photos=1)
+    out = run_js(page, """
+        document.dispatch('DOMContentLoaded');
+
+        // 1. Clipboard API entirely absent.
+        navigator.clipboard = undefined;
+        copyCSV();
+        const unavailable = {
+            message: __byId['copy-success'].textContent,
+            shown: __byId['copy-success'].classList.contains('show'),
+        };
+
+        // 2. Present but rejecting, as a blocked file:// page does.
+        let called = false;
+        let blockedMessage = null;
+        navigator.clipboard = {
+            writeText: () => { called = true; return Promise.reject(new Error('blocked')); },
+        };
+        __byId['copy-success'].textContent = '';
+        copyCSV();
+
+        // Let the rejection handler run, then exercise the success path too.
+        Promise.resolve().then(() => {}).then(() => {}).then(() => {
+            blockedMessage = __byId['copy-success'].textContent;
+            navigator.clipboard = { writeText: () => Promise.resolve() };
+            __byId['copy-success'].textContent = '';
+            copyCSV();
+        }).then(() => {}).then(() => {}).then(() => {
+            console.log(JSON.stringify({
+                unavailable: unavailable,
+                writeTextCalled: called,
+                blocked: blockedMessage,
+                success: __byId['copy-success'].textContent,
+            }));
+        });
+    """)
+    result = json.loads(out)
+    assert "unavailable" in result["unavailable"]["message"].lower()
+    assert "Download CSV File" in result["unavailable"]["message"], (
+        "the message must point at the working alternative"
+    )
+    assert result["unavailable"]["shown"] is True, "the banner was never shown"
+    assert result["writeTextCalled"] is True
+    assert "blocked" in result["blocked"].lower()
+    assert "Download CSV File" in result["blocked"]
+    assert result["success"] == "CSV content copied to clipboard!"
 
 
 def test_no_selection_keys_are_seeded_beyond_a_photo_count(tmp_path):
