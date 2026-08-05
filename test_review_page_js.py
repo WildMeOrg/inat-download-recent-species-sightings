@@ -34,7 +34,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def build_page(tmp_path, n_photos=4, social_split=False, licenses=None, specs=None,
-               missing_photos=None):
+               missing_photos=None, csv_name=None):
     """Generate a real review page and return its path.
 
     The simple call style is unchanged: `build_page(tmp_path, n_photos=4)`
@@ -65,26 +65,48 @@ def build_page(tmp_path, n_photos=4, social_split=False, licenses=None, specs=No
     exports; a test needs this to prove a split row previews the photo it
     exports rather than a later one.
 
-    "place_guess" / "common_name" -- override the benign defaults. Real
-    iNaturalist localities look like "Pocone, BR-MT, BR" (see update_states.py),
-    and the defaults here contain no comma, quote or newline, so a CSV-quoting
-    test needs to supply its own hostile values.
+    "place_guess" / "common_name" / "location" -- override the benign defaults.
+    Real iNaturalist localities look like "Pocone, BR-MT, BR" (see
+    update_states.py), and the defaults here contain no comma, quote, newline or
+    leading formula character, so CSV-quoting and formula-guard tests need to
+    supply their own hostile values. "location" is iNaturalist's raw "lat,lon"
+    string, which is the only way to get real (negative) coordinates onto the
+    page -- the default fixture has none at all.
+
+    "gif_frames" -- give this observation animated-GIF media: each of its photos
+    arrives as a .gif that extract_gif_frames expands into that many JPEG files.
+    One iNaturalist photo therefore becomes N entries in photo_filenames, which
+    is the case where splitting per file would emit N Encounters of one animal
+    in one instant.
+
+    Pass `csv_name` to ALSO write the direct-CSV export of the same rows into the
+    same directory, so a test can compare the two export paths cell by cell.
+    write_csv and write_html are both non-destructive, so this changes nothing
+    about the page.
     """
     if specs is None:
         specs = [{"id": 111, "n_photos": n_photos, "licenses": licenses,
                   "missing_photos": missing_photos}]
 
     obs_payloads = []
-    photo_plan = []  # (obs_id, count, missing) -- used to write stub photo files
+    photo_plan = []  # (obs_id, missing) -- used to write stub photo files
+    frame_counts = {}  # downloaded photo stem -> frames its GIF expands into
     for i, spec in enumerate(specs):
         obs_id = spec.get("id", 111 + i)
         obs_n_photos = spec.get("n_photos", n_photos)
         obs_licenses = spec.get("licenses", licenses)
         obs_missing = spec.get("missing_photos", missing_photos) or []
+        gif_frames = spec.get("gif_frames")
+        extension = "gif" if gif_frames else "jpg"
         photos = []
         for j in range(obs_n_photos):
             code = "cc-by" if obs_licenses is None else obs_licenses[j]
-            photos.append({"url": "https://example.test/a/square.jpg", "license_code": code})
+            photos.append({
+                "url": f"https://example.test/a/square.{extension}",
+                "license_code": code,
+            })
+            if gif_frames:
+                frame_counts[f"{obs_id}_{j + 1}"] = gif_frames
         payload = {
             "id": obs_id,
             "taxon": {
@@ -97,20 +119,33 @@ def build_page(tmp_path, n_photos=4, social_split=False, licenses=None, specs=No
         }
         if spec.get("annotations"):
             payload["annotations"] = spec["annotations"]
+        if spec.get("location"):
+            payload["location"] = spec["location"]
         obs_payloads.append(payload)
-        photo_plan.append((obs_id, obs_n_photos, obs_missing))
+        photo_plan.append((obs_id, obs_missing))
 
     d = mod.iNaturalistDownloader(
         output_dir=str(tmp_path), days_back=1, species_list=["Panthera onca"],
         social_split=social_split,
     )
     d.download_photo = lambda url, filename: True
+    # Same filenames the real extractor produces ("<stem>_frame<N>.jpg"), and it
+    # is only ever reached for a .gif, so a page with no GIF spec is unaffected.
+    d.extract_gif_frames = lambda path: [
+        f"{path.stem}_frame{i}.jpg" for i in range(frame_counts.get(path.stem, 0))
+    ]
     rows = d.process_observations(obs_payloads, "Panthera onca")
-    for obs_id, count, missing in photo_plan:
-        for i in range(1, count + 1):
-            if i in missing:
+    # Stub the files the rows actually reference -- which for a GIF observation
+    # are the extracted frames, not the downloaded photo. `missing_photos` is
+    # 1-based over that same list.
+    for row, (obs_id, missing) in zip(rows, photo_plan):
+        assert row["observation_id"] == obs_id, "row order does not follow specs"
+        for position, filename in enumerate(row["_photo_list"], start=1):
+            if position in missing:
                 continue
-            (tmp_path / "photos" / f"{obs_id}_{i}.jpg").write_bytes(b"x")
+            (tmp_path / "photos" / filename).write_bytes(b"x")
+    if csv_name:
+        d.write_csv(rows, csv_name)
     d.write_html(rows, "review.html")
     return tmp_path / "review.html"
 
@@ -898,3 +933,188 @@ def test_flag_mode_respects_the_organism_evidence_suppression(tmp_path):
         {"id": 222, "initially": False, "split": False},
     ], "the organism-evidence observation was split anyway"
     assert result["rows"] == 4, "3 rows for the split one plus 1 merged"
+
+
+def test_split_rows_carry_their_own_photo_licence(tmp_path):
+    """The browser's per-photo licence lookup, which nothing asserted.
+
+    generateCSV's split branch reads licenses[photoIndex]; changing that to
+    licenses[0] kept the whole suite green, because every other fixture gives
+    every photo the same licence. Three distinct codes make a misalignment
+    impossible to hide, and every split Encounter silently inheriting the first
+    photo's licence is exactly the kind of wrong metadata a Wildbook import
+    cannot detect. The Python split path has had this test since Task 1.
+    """
+    licenses = ["cc-by", "cc-by-nc", "cc0"]
+    page = build_page(tmp_path, n_photos=3, licenses=licenses)
+    out = run_js(page, """
+        toggleSplit(111);
+        const rows = getSelectedObservations();
+        if (rows.length !== 3) throw new Error('expected 3 split rows, got ' + rows.length);
+        console.log(generateCSV(rows));
+    """)
+
+    parsed = list(csv.reader(io.StringIO(out)))
+    header, data = parsed[0], parsed[1:]
+    assert len(data) == 3, f"expected 3 data rows, parsed {len(data)}"
+    records = [dict(zip(header, row)) for row in data]
+
+    # Each split Encounter carries its own photo AND that photo's licence, in order.
+    assert [r["Encounter.mediaAsset0"] for r in records] == [
+        "111_1.jpg", "111_2.jpg", "111_3.jpg"
+    ], "the split rows are not in photo order, so the licence check below is meaningless"
+    assert [r["Encounter.mediaAsset0.license"] for r in records] == licenses, (
+        "a split Encounter was given another photo's licence"
+    )
+    # An all-split export carries exactly one media column pair, so there is no
+    # second licence column for the right value to be hiding in.
+    assert [h for h in header if h.startswith("Encounter.mediaAsset")] == [
+        "Encounter.mediaAsset0", "Encounter.mediaAsset0.license"
+    ]
+
+
+def test_gif_frames_cannot_be_split_into_one_encounter_each(tmp_path):
+    """An animated GIF is ONE iNaturalist photo, however many files it becomes.
+
+    extract_gif_frames expands it into N JPEGs in photo_filenames, and splitting
+    counts files -- so a 30-frame GIF offered a Split button that produced 30
+    Encounters of the same animal at the same instant, i.e. 29 guaranteed
+    self-matches for Wildbook's ID pipeline. Splitting is refused for such an
+    observation; it exports as one Encounter carrying every frame, exactly as it
+    does today with no flag.
+
+    The ordinary observation on the page is what keeps this honest: the Split
+    column must still exist and still work for it.
+    """
+    page = build_page(tmp_path, specs=[
+        {"id": 111, "n_photos": 2},                    # ordinary: splittable
+        {"id": 222, "n_photos": 1, "gif_frames": 3},   # one GIF -> three files
+    ])
+    out = run_js(page, """
+        initializeSplitColumn();
+        renderObservations();
+        const gif = observations.find(o => o.observation_id === 222);
+        const rowsFor = (id) => displayRows().filter(r => r.obs.observation_id === id).length;
+
+        const before = rowsFor(222);
+        toggleSplit(222);                  // must be refused outright
+        const afterToggle = rowsFor(222);
+        renderObservations();
+
+        const buttonIds = __byId['observations-body'].children
+            .filter(tr => tr.children.length && tr.children[tr.children.length - 1].children.length)
+            .map(tr => Number(tr.getAttribute('data-observation-id')));
+
+        const csv = generateCSV(getSelectedObservations()).split('\\n');
+        const header = csv[0].split(',');
+        const gifRows = csv.slice(1).map(l => l.split(',')).filter(r => r[0] === '222');
+
+        console.log(JSON.stringify({
+            files: gif.photo_count,
+            filenames: gif.photo_filenames,
+            canSplit: gif.can_split,
+            initiallySplit: gif.initially_split,
+            rowsBefore: before,
+            rowsAfterToggle: afterToggle,
+            splitStateEntry: splitState.get(222) || false,
+            buttonIds: buttonIds,
+            headerRevealed: __byId['split-header'].style.display === '',
+            gifCsvRows: gifRows.length,
+            gifCsvPhotoCount: gifRows[0][header.indexOf('photo_count')],
+        }));
+    """)
+    result = json.loads(out)
+    # The fixture really does turn one photo into three files, or nothing here bites.
+    assert result["files"] == 3
+    assert result["filenames"] == "222_1_frame0.jpg; 222_1_frame1.jpg; 222_1_frame2.jpg"
+    assert result["canSplit"] is False, "the GIF observation was offered as splittable"
+    assert result["initiallySplit"] is False
+    assert result["rowsBefore"] == 1
+    assert result["rowsAfterToggle"] == 1, "the GIF's frames became one display row each"
+    assert result["splitStateEntry"] is False, "toggleSplit recorded a split it must refuse"
+    # A button for the ordinary observation, none for the GIF.
+    assert result["buttonIds"] == [111], (
+        f"Split buttons rendered for {result['buttonIds']}, expected only 111"
+    )
+    assert result["headerRevealed"] is True, "the ordinary observation lost its Split column"
+    # And it exports as a single Encounter carrying all three frames.
+    assert result["gifCsvRows"] == 1
+    assert result["gifCsvPhotoCount"] == "3"
+
+
+def test_a_page_with_nothing_splittable_has_no_split_column(tmp_path):
+    """The Split column is gated on can_split, not on the file count.
+
+    A single animated GIF gives maxPhotos > 1 with nothing splittable on the
+    page, so gating the column on maxPhotos would reveal a Split header over a
+    column that can never hold a button. The <th> and the <td> must move
+    together: the head/body cell counts have disagreed on this page once
+    already.
+    """
+    page = build_page(tmp_path, specs=[{"id": 111, "n_photos": 1, "gif_frames": 3}])
+    out = run_js(page, """
+        initializeSplitColumn();
+        renderObservations();
+        const rows = __byId['observations-body'].children;
+        console.log(JSON.stringify({
+            maxPhotos: maxPhotos,
+            columnShown: splitColumnShown,
+            headerRevealed: __byId['split-header'].style.display === '',
+            renderedRows: rows.length,
+            cellCounts: [...new Set(rows.map(tr => tr.children.length))],
+            buttons: __created.filter(e => e.className.includes('btn-split')).length,
+        }));
+    """)
+    result = json.loads(out)
+    assert result["maxPhotos"] == 3, "the fixture must have more files than source photos"
+    assert result["renderedRows"] == 1, "nothing was rendered, so the test is vacuous"
+    assert result["columnShown"] is False
+    assert result["headerRevealed"] is False, "a Split column no button can fill"
+    assert result["buttons"] == 0
+    assert result["cellCounts"] == [11] == [_visible_header_cells(page, False)]
+
+
+def test_both_export_paths_emit_the_same_values(tmp_path):
+    """Same rows, same run, both writers: every cell must agree.
+
+    The sibling test in test_export_integrity.py compares only the two column
+    LISTS, and the paths diverged anyway -- on values. Both browser exporters
+    neutralise spreadsheet formulas and neither Python writer did, so a locality
+    beginning with "-" left the direct CSV as a live formula payload and left the
+    review page with a stray apostrophe stored as data. Comparing headers could
+    never see that; this compares the cells.
+    """
+    hostile_locality = "-Somewhere odd"
+    hostile_common = "=SUM(1+1)"
+    page = build_page(tmp_path, csv_name="direct.csv", specs=[{
+        "id": 111,
+        "n_photos": 2,
+        "place_guess": hostile_locality,
+        "common_name": hostile_common,
+        "location": "-16.5,-56.2",       # southern/western: genuine negatives
+    }])
+    out = run_js(page, "console.log(generateCSV(getSelectedObservations()));")
+
+    browser = list(csv.reader(io.StringIO(out)))
+    with open(tmp_path / "direct.csv", newline="", encoding="utf-8") as fh:
+        python = list(csv.reader(fh))
+
+    assert len(python) == len(browser) == 2, "expected one header and one data row each"
+    assert python[0] == browser[0], "the two exports disagree on columns"
+    python_record = dict(zip(python[0], python[1]))
+    browser_record = dict(zip(browser[0], browser[1]))
+    differing = {
+        column: (python_record[column], browser_record[column])
+        for column in python[0]
+        if python_record[column] != browser_record[column]
+    }
+    assert differing == {}, f"the two export paths disagree on values: {differing}"
+
+    # And the agreed value is the guarded one, in both.
+    assert python_record["Encounter.verbatimLocality"] == "'" + hostile_locality, (
+        "a formula-leading locality reached the Wildbook CSV live"
+    )
+    assert python_record["common_name"] == "'" + hostile_common
+    # Genuine negative coordinates must NOT be quoted into text.
+    assert python_record["Encounter.decimalLatitude"] == "-16.5"
+    assert python_record["Encounter.decimalLongitude"] == "-56.2"

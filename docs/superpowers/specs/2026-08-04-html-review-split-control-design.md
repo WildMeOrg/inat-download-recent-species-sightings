@@ -42,6 +42,14 @@ Recorded because each closed off a real alternative:
    C+D are individual 2"). A 4-photo observation showing 2 individuals splits to 4 rows or
    stays at 1. Arbitrary grouping needs per-photo assignment UI and is deferred until the
    simple version has been used in anger.
+
+   > **Amended after the final whole-branch review.** "Photo" here means an iNaturalist
+   > photo, and the code counted *files*. An animated GIF is one photo that
+   > `extract_gif_frames` turns into N JPEGs, so a 30-frame GIF was offering a Split button
+   > that produced 30 Encounters of one animal at one instant. Grouping a split row's frames
+   > together would contradict the export table below (a split row is exactly one media
+   > asset), so such observations are simply not splittable, in either mode. They export as
+   > one Encounter carrying every frame, which is what the default mode already does.
 2. **Split expands the table, and each row is independently selectable.** The reviewer can
    drop one bad photo and keep the rest. This is deliberately *not* symmetric with the
    existing Merge button, which only affects the export.
@@ -88,6 +96,13 @@ This ordering matters beyond tidiness. The bug fixed in `8c70595` — deduplicat
 split rows because it keyed on `observation_id` — was caused by dedup running *after*
 splitting. It now cannot: dedup only ever sees one row per observation. The composite
 `(observation_id, photos)` key stays as a cheap guard.
+
+> **Amended after the final whole-branch review.** That last sentence was wrong and the
+> composite key was removed. It is not a cheap guard but a strictly weaker one: two passes
+> over the same observation need not agree on its photo list (one transient photo-download
+> failure is enough), and both rows then survive as duplicate Encounters sharing media that
+> self-matches in Wildbook. `deduplicate_rows` keys on `observation_id` alone and keeps the
+> row with the most photos.
 
 `split_rows_by_photo(rows)` owns the split decision, including the organism-evidence
 suppression, and is a pure rows→rows function with no API or filesystem access — testable in

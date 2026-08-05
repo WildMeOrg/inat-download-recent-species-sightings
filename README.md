@@ -231,10 +231,15 @@ python3 inat-download-new-species-sightings.py \
 - All rows from the same observation share a common `Sighting.sightingID` UUID to preserve the relationship
 - Observations carrying iNaturalist's "Evidence of Presence: Organism" annotation are NOT split (all photos kept together)
 - Single-photo observations remain as single rows
+- Observations whose media includes an animated GIF are NOT split. The utility expands an
+  animated GIF into one JPEG per frame, but those frames are one iNaturalist photo of one
+  animal at one instant; splitting them would create an Encounter per frame and every one
+  of them would match every other
 
 **Example result:**
 - Original: 1 observation with 4 photos → 4 CSV rows (each with 1 photo, same Sighting.sightingID)
 - "Evidence of Presence: Organism" observation with 3 photos → 1 CSV row (all 3 photos together)
+- Observation whose only photo is a 30-frame animated GIF → 1 CSV row (all 30 frames together)
 
 > **Open question — the split-suppression rule is probably too broad.** This
 > code was written believing iNaturalist has a "single subject" annotation
@@ -259,6 +264,10 @@ Every observation with more than one photo gets a **Split** button, whether or n
 photo, each with its own checkbox, all sharing one `Sighting.sightingID` so Wildbook
 still records them as a single sighting. Deselect any photo to leave it out entirely.
 **Unsplit** collapses the rows back together.
+
+The one exception is an observation whose media came from an animated GIF: its frames are
+one photo, so it gets no Split button and the Split column disappears entirely on a page
+where nothing else can be split. See the CSV-mode note above.
 
 - Rows from the same observation are colour-coded (alternating backgrounds) so you can
   see which belong together
@@ -380,6 +389,14 @@ The CSV file contains the following columns:
 | Encounter.mediaAsset2... | Additional photo columns (dynamically created) |
 
 **Note:** The number of `Encounter.mediaAsset` columns is determined by the maximum number of photos across all observations in the dataset. Observations with fewer photos will have empty cells in the extra columns.
+
+**Note on leading apostrophes.** iNaturalist free text (localities, common names, usernames)
+reaches this file verbatim, and a value beginning `=`, `+`, `-`, `@`, a tab or a carriage return
+is a live formula to Excel and Google Sheets. Every export path — the direct CSV, the review
+page's Download/Copy buttons, and the Flickr exporter — prefixes such a value with an apostrophe
+so it displays as text. Genuine negative numbers are left alone, so southern latitudes and
+western longitudes still export as numbers. If you see a locality like `'-Somewhere odd`, the
+apostrophe is that guard rather than part of the observation.
 
 ## Using the output with Wildbook
 

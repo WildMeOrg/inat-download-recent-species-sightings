@@ -15,9 +15,11 @@ Each test here pins down a bug that shipped once already:
    split observation back together dropped every photo past the first.
 """
 
+import ast
 import copy
 import csv
 import importlib.util
+import io
 import json
 import re
 import tempfile
@@ -39,6 +41,9 @@ INTERNAL_FIELDS = (
     "_geoprivacy",
     "_taxon_geoprivacy",
     "_public_positional_accuracy",
+    "_sighting_id",
+    "_split_eligible",
+    "_gif_frames_extracted",
 )
 
 
@@ -92,6 +97,186 @@ def test_dedup_still_collapses_true_duplicates():
         assert len(deduped) == 1, (
             f"the same observation appeared twice and dedup kept {len(deduped)} rows"
         )
+
+
+def test_dedup_keeps_the_row_with_every_photo_when_the_passes_disagree():
+    """Two passes over one observation need not agree on its photo list.
+
+    Two species names resolving to one taxon is the case deduplication exists
+    for; one transient photo-download failure is all it takes for the two passes
+    to see different media. A composite (observation_id, photos) key then treats
+    them as different rows and BOTH survive, so Wildbook gets two Encounters
+    with the same Encounter.otherCatalogNumbers, sharing photos that self-match
+    -- a fabricated resight of one animal at one instant. With the split flag it
+    is worse: 3 photos become 5 Encounters across 2 Sightings.
+
+    Deduplication must therefore key on observation_id alone, and keep the
+    complete row rather than whichever arrived first.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _downloader(tmp, social_split=True)
+
+        # Pass 1: photo 2 fails to download. Pass 2: everything succeeds.
+        d.download_photo = lambda url, filename: not filename.endswith("_2.jpg")
+        rows = d.process_observations([_obs(n_photos=3)], "Panthera onca")
+        d.download_photo = lambda url, filename: True
+        rows += d.process_observations([_obs(n_photos=3)], "jaguar")
+
+        assert [len(r["_photo_list"]) for r in rows] == [2, 3], "fixture setup sanity check"
+
+        deduped = d.deduplicate_rows(rows)
+        assert len(deduped) == 1, (
+            f"observation 111 survived {len(deduped)} times, so Wildbook would get "
+            "that many Encounters for one observation"
+        )
+        assert deduped[0]["_photo_list"] == ["111_1.jpg", "111_2.jpg", "111_3.jpg"], (
+            "dedup kept the row that lost a photo to a failed download"
+        )
+
+        # The CSV consequence: one Encounter, and no photo attached twice.
+        d.write_csv(deduped, "out.csv")
+        with open(Path(tmp) / "out.csv", encoding="utf-8", newline="") as f:
+            csv_rows = list(csv.reader(f))
+        assert len(csv_rows) == 2, "more than one CSV row for a single observation"
+        catalog = csv_rows[0].index("Encounter.otherCatalogNumbers")
+        assert csv_rows[1][catalog] == "iNaturalist:111"
+
+        # And with the flag: 3 photos, 3 Encounters, 1 Sighting -- not 5 and 2.
+        split = mod.split_rows_by_photo(deduped)
+        assert len(split) == 3
+        assert len({r["Sighting.sightingID"] for r in split}) == 1
+        assert sorted(r["photo_filenames"] for r in split) == [
+            "111_1.jpg", "111_2.jpg", "111_3.jpg"
+        ], "a photo was attached to more than one Encounter"
+
+
+def test_download_photo_retries_a_transient_failure():
+    """fetch_json retries; download_photo did not, so one blip dropped a photo.
+
+    A dropped photo is not merely a missing image: it is what makes two passes
+    over the same observation disagree about its media, which is the trigger for
+    the duplicate-Encounter case above.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        # rate_limit=0 so the backoff sleep is instant.
+        d = _downloader(tmp, rate_limit=0)
+        del d.download_photo          # drop the stub; exercise the real method
+
+        attempts = []
+
+        def fake_urlopen(url, timeout=None):
+            attempts.append(url)
+            if len(attempts) == 1:
+                raise OSError("connection reset by peer")
+            # BytesIO is both a readable file object and a context manager,
+            # which is all `with urlopen(...) as response` needs here.
+            return io.BytesIO(b"jpeg-bytes")
+
+        original = mod.urllib.request.urlopen
+        mod.urllib.request.urlopen = fake_urlopen
+        try:
+            assert d.download_photo("https://example.test/p.jpg", "111_1.jpg") is True, (
+                "a single transient failure still loses the photo"
+            )
+        finally:
+            mod.urllib.request.urlopen = original
+
+        assert len(attempts) == 2, f"expected one retry, made {len(attempts)} attempts"
+        assert (Path(tmp) / "photos" / "111_1.jpg").exists()
+        assert not list((Path(tmp) / "photos").glob("*.part")), "a .part file was left behind"
+
+
+def test_gif_frames_are_not_split_into_one_encounter_each():
+    """An animated GIF is ONE iNaturalist photo, however many files it becomes.
+
+    extract_gif_frames turns it into N JPEGs inside photo_filenames, and both
+    _split_eligible and the review page's Split button count files -- so a
+    30-frame GIF would become 30 Encounters of the same animal in the same
+    second, 29 of them guaranteed self-matches for Wildbook's ID pipeline.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _downloader(tmp, social_split=True)
+        gif = _obs(n_photos=1)
+        gif["photos"][0]["url"] = "https://example.test/a/square.gif"
+        d.extract_gif_frames = lambda path: [
+            f"{path.stem}_frame{i}.jpg" for i in range(3)
+        ]
+
+        rows = d.process_observations([gif], "Panthera onca")
+        assert rows[0]["_photo_list"] == [
+            "111_1_frame0.jpg", "111_1_frame1.jpg", "111_1_frame2.jpg"
+        ], "fixture setup sanity check: one photo must have become three files"
+        assert rows[0]["_gif_frames_extracted"] is True
+        assert rows[0]["_split_eligible"] is False, (
+            "frames of one GIF were offered up as separate individuals"
+        )
+
+        split = mod.split_rows_by_photo(rows)
+        assert len(split) == 1, f"the GIF's frames became {len(split)} Encounters"
+        assert split[0]["photo_count"] == 3, "the frames must stay on the one Encounter"
+
+        # The review page must not offer the button either.
+        d.write_html(rows, "review.html")
+        entry = _payload((Path(tmp) / "review.html").read_text(encoding="utf-8"))[0]
+        assert entry["can_split"] is False
+        assert entry["initially_split"] is False
+
+        # An ordinary multi-photo observation is unaffected.
+        plain = d.process_observations([_obs(obs_id=222, n_photos=3)], "Panthera onca")
+        assert plain[0]["_gif_frames_extracted"] is False
+        assert plain[0]["_split_eligible"] is True
+        d.write_html(plain, "plain.html")
+        plain_entry = _payload((Path(tmp) / "plain.html").read_text(encoding="utf-8"))[0]
+        assert plain_entry["can_split"] is True
+
+
+def test_csv_neutralises_spreadsheet_formulas_in_free_text():
+    """iNaturalist free text lands in a file biologists open in Excel.
+
+    Both browser exporters have prefixed an apostrophe to formula-leading values
+    since before this branch; neither Python writer did, so the same locality
+    exported as `-Somewhere odd` from the direct CSV and `'-Somewhere odd` from
+    the review page. Genuine negative numbers -- southern latitudes, western
+    longitudes -- must stay untouched.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _downloader(tmp)
+        hostile = _obs(place_guess="-Somewhere odd")
+        hostile["location"] = "-16.5,-56.2"
+        hostile["taxon"]["preferred_common_name"] = "=HYPERLINK(\"http://evil\")"
+        hostile["user"] = {"login": "@someone"}
+        rows = d.process_observations([hostile], "Panthera onca")
+        d.write_csv(rows, "out.csv")
+
+        with open(Path(tmp) / "out.csv", encoding="utf-8", newline="") as f:
+            record = dict(zip(*list(csv.reader(f))[:2]))
+
+        assert record["Encounter.verbatimLocality"] == "'-Somewhere odd"
+        assert record["common_name"] == "'=HYPERLINK(\"http://evil\")"
+        assert record["observer"] == "'@someone"
+        # Real coordinates are numbers, not text.
+        assert record["Encounter.decimalLatitude"] == "-16.5"
+        assert record["Encounter.decimalLongitude"] == "-56.2"
+        # And a benign value gains nothing.
+        assert record["scientific_name"] == "Panthera onca"
+        assert record["observation_id"] == "111"
+
+
+def test_neutralize_formula_matches_the_browser_rule():
+    """The rule is written out four times (two Python, two JavaScript).
+
+    Pinning the boundary cases here means the Python copies cannot drift from
+    the documented rule silently -- particularly the numeric exemption, which is
+    the only thing keeping every southern latitude out of quotes.
+    """
+    for value in ("=1+1", "+1", "-Somewhere odd", "@user", "\tlead", "\rlead", "-16.5."):
+        assert mod.neutralize_formula(value) == "'" + value, value
+    for value in ("-16.5", "-56", "0", "3.14", ".5", "-.5", "Pantanal", "", "cc-by"):
+        assert mod.neutralize_formula(value) == value, value
+    # Non-strings come back untouched, so benign output is byte-identical.
+    assert mod.neutralize_formula(None) is None
+    assert mod.neutralize_formula(-16.5) == -16.5
+    assert mod.neutralize_formula(111) == 111
 
 
 def test_csv_header_has_no_internal_fields():

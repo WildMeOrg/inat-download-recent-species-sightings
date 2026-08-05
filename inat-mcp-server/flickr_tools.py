@@ -40,6 +40,49 @@ def _json_for_script_block(payload: Any) -> str:
     )
 
 
+# A cell a spreadsheet would evaluate rather than display. re.ASCII so \d means
+# 0-9 exactly as JavaScript's \d does -- without it "-٣" would count as a number
+# here and not in the browser.
+_FORMULA_LEAD_CHARS = ('=', '+', '-', '@', '\t', '\r')
+_PLAIN_NUMBER_RE = re.compile(r'^-?\d*\.?\d+$', re.ASCII)
+
+
+def neutralize_formula(value: Any) -> Any:
+    """
+    Prefix an apostrophe to a value a spreadsheet would treat as a formula.
+
+    Photo titles and descriptions come from Flickr users and reach the Wildbook
+    CSV verbatim, so a title beginning "=" or "-" or "@" becomes a live formula
+    the moment someone opens the file in Excel or Sheets.
+
+    Genuine negative numbers -- every southern latitude, every western longitude
+    -- are left alone, so this must test for a leading formula character AND for
+    the value not being a plain number.
+
+    FOUR COPIES OF THIS RULE EXIST and must stay identical, or the same record
+    exports differently depending on which button the user pressed:
+      1. here, for this module's write_csv
+      2. neutralize_formula() in inat-download-new-species-sightings.py -- a
+         separate copy on purpose: this MCP server module must not import that
+         hyphenated top-level script, and the script must not depend on this
+         package
+      3. the escape() closure in this module's generated review page
+      4. escapeCSV() in the iNaturalist script's generated review page
+
+    Args:
+        value: Any CSV cell value
+
+    Returns:
+        The value unchanged, or a string with a leading apostrophe.
+    """
+    if value is None:
+        return value
+    text = str(value)
+    if text[:1] in _FORMULA_LEAD_CHARS and not _PLAIN_NUMBER_RE.match(text):
+        return "'" + text
+    return value
+
+
 def _safe_float(value: Any, limit: float = None) -> Optional[float]:
     """
     Parse an API-supplied coordinate, returning None rather than raising.
@@ -1258,7 +1301,11 @@ class FlickrDownloader:
                 export_row[f'Encounter.mediaAsset{i}.license'] = (
                     license_list[i] if i < len(license_list) else None
                 )
-            export_rows.append(export_row)
+            # Applied to every cell, exactly as the review page's escape()
+            # closure does, so the two export paths cannot disagree.
+            export_rows.append(
+                {k: neutralize_formula(v) for k, v in export_row.items()}
+            )
 
         with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)

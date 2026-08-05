@@ -10,6 +10,7 @@ including observation data (CSV) and photos.
 import argparse
 import csv
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,6 +29,51 @@ import uuid
 HTTP_TIMEOUT = 30
 DOWNLOAD_TIMEOUT = 120
 MAX_RETRIES = 3
+
+# A cell a spreadsheet would evaluate rather than display. re.ASCII so \d means
+# 0-9 exactly as JavaScript's \d does -- without it "-٣" would count as a number
+# here and not in the browser.
+_FORMULA_LEAD_CHARS = ('=', '+', '-', '@', '\t', '\r')
+_PLAIN_NUMBER_RE = re.compile(r'^-?\d*\.?\d+$', re.ASCII)
+
+
+def neutralize_formula(value: Any) -> Any:
+    """
+    Prefix an apostrophe to a value a spreadsheet would treat as a formula.
+
+    iNaturalist free text (place_guess, common names, user logins) reaches the
+    Wildbook CSV verbatim, and a locality beginning "=" or "-" or "@" becomes a
+    live formula the moment someone opens the file in Excel or Sheets.
+
+    Genuine negative numbers -- every southern latitude, every western longitude
+    -- are left alone, so this must test for a leading formula character AND for
+    the value not being a plain number.
+
+    FOUR COPIES OF THIS RULE EXIST and must stay identical, or the same
+    observation exports differently depending on which button the reviewer
+    pressed (measured once: `-Somewhere odd` from the direct CSV against
+    `'-Somewhere odd` from the review page):
+      1. here, for this module's write_csv
+      2. neutralize_formula() in inat-mcp-server/flickr_tools.py -- a separate
+         copy on purpose: the MCP server must not import this hyphenated
+         top-level script, and this script must not depend on the server package
+      3. escapeCSV() in this module's generated review page
+      4. the escape() closure in flickr_tools' generated review page
+
+    Args:
+        value: Any CSV cell value
+
+    Returns:
+        The value unchanged, or a string with a leading apostrophe. Non-strings
+        that need no guard come back untouched, so benign output is byte-for-byte
+        what it was before this guard existed.
+    """
+    if value is None:
+        return value
+    text = str(value)
+    if text[:1] in _FORMULA_LEAD_CHARS and not _PLAIN_NUMBER_RE.match(text):
+        return "'" + text
+    return value
 
 
 def fetch_json(url: str, rate_limit: float = 1.0, timeout: int = HTTP_TIMEOUT,
@@ -348,6 +394,13 @@ class iNaturalistDownloader:
         """
         Download a photo from URL to the photos directory.
 
+        Retries transient failures the same way fetch_json does. A photo lost to
+        a one-off network blip is not cosmetic: the row's photo list comes out
+        short, and a second pass over the same observation (two species names
+        resolving to one taxon) then disagrees with the first about which media
+        the observation has. deduplicate_rows survives that by construction, but
+        the cheapest fix is not to drop the photo in the first place.
+
         Args:
             url: URL of the photo
             filename: Filename to save as
@@ -364,16 +417,33 @@ class iNaturalistDownloader:
         # Download to a sibling .part file and rename on success, so an
         # interrupted transfer is not cached as a complete photo.
         partial = filepath.with_name(filepath.name + '.part')
-        try:
-            with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response, \
-                    open(partial, 'wb') as out:
-                shutil.copyfileobj(response, out)
-            partial.replace(filepath)
-            return True
-        except Exception as e:
-            print(f"      Error downloading photo {filename}: {e}")
-            partial.unlink(missing_ok=True)
-            return False
+        last_error = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response, \
+                        open(partial, 'wb') as out:
+                    shutil.copyfileobj(response, out)
+                partial.replace(filepath)
+                return True
+            except urllib.error.HTTPError as e:
+                last_error = e
+                partial.unlink(missing_ok=True)
+                # 4xx other than rate-limiting will not improve on retry.
+                if e.code != 429 and e.code < 500:
+                    break
+            except Exception as e:
+                last_error = e
+                partial.unlink(missing_ok=True)
+
+            if attempt < MAX_RETRIES:
+                backoff = self.rate_limit * (2 ** attempt)
+                print(f"      Photo download failed ({last_error}); retrying in "
+                      f"{backoff:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(backoff)
+
+        print(f"      Error downloading photo {filename}: {last_error}")
+        return False
 
     def extract_gif_frames(self, gif_path: Path) -> List[str]:
         """
@@ -572,6 +642,9 @@ class iNaturalistDownloader:
             photos = obs.get('photos', [])
             photo_filenames = []
             photo_licenses = []
+            # True once one iNaturalist photo has become several files, which
+            # only happens for an animated GIF. See _split_eligible below.
+            gif_frames_extracted = False
 
             if photos:
                 print(f"  Processing observation {idx}/{len(observations)} (ID: {obs_id}, {len(photos)} photos)...")
@@ -597,6 +670,7 @@ class iNaturalistDownloader:
                             extracted_frames = self.extract_gif_frames(photo_path)
                             if extracted_frames:
                                 # Add all extracted frames to the list (GIF was deleted)
+                                gif_frames_extracted = True
                                 for frame_filename in extracted_frames:
                                     photo_filenames.append(frame_filename)
                                     photo_licenses.append(license_code)
@@ -630,10 +704,20 @@ class iNaturalistDownloader:
             # path, or the reviewer's Split button on the HTML path. Promoting it
             # unconditionally would populate a column that is empty today.
             sighting_id = None
+            # An animated GIF is ONE iNaturalist photo that extract_gif_frames
+            # turned into N JPEG files. Splitting counts files, so a 30-frame GIF
+            # would become 30 Encounters of the same animal in the same second --
+            # 29 guaranteed self-matches for Wildbook's ID pipeline. Splitting is
+            # therefore refused for the whole observation: the spec (decision 1,
+            # and the export table) fixes a split row at exactly one media asset,
+            # so a frame group cannot be one row, and the fallback -- one
+            # Encounter carrying every frame, exactly as today's default mode
+            # exports it -- is the conservative answer.
             split_eligible = (
                 self.social_split
                 and len(photo_filenames) > 1
                 and not has_organism_evidence
+                and not gif_frames_extracted
             )
 
             row = {
@@ -673,6 +757,7 @@ class iNaturalistDownloader:
                 '_public_positional_accuracy': public_positional_accuracy,  # Accuracy in meters
                 '_sighting_id': str(uuid.uuid4()),  # Promoted to the column only when split
                 '_split_eligible': split_eligible,  # Whether the flag would split this one
+                '_gif_frames_extracted': gif_frames_extracted,  # Files outnumber source photos
             }
             processed_data.append(row)
 
@@ -680,23 +765,39 @@ class iNaturalistDownloader:
 
     def deduplicate_rows(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Drop rows that describe the same observation *and* the same media.
+        Keep exactly one row per observation.
 
         Several species names can resolve to one taxon, so the same observation
-        can be processed more than once. Keying on observation_id alone is not
-        enough: with --social-split-observations one observation legitimately
-        produces several rows, distinguished only by which photo they carry.
+        can be processed more than once. The key is observation_id ALONE, and it
+        has to stay that way: splitting now runs strictly after deduplication
+        (see split_rows_by_photo and run()), so every row reaching here describes
+        a whole observation and two rows sharing an ID are always duplicates.
+
+        A composite (observation_id, photos) key used to be needed when
+        process_observations did the splitting itself. It is now strictly weaker
+        than the ID alone: the two passes over one observation need not agree on
+        the photo list -- a transient download failure in the first pass is
+        enough -- and both rows would then survive, giving Wildbook two
+        Encounters carrying the same Encounter.otherCatalogNumbers and the same
+        media. Identical media in two Encounters self-match, fabricating a
+        resight of one animal at one instant.
+
+        On collision the row with the most photos wins, so a pass that lost a
+        photo to a failed download cannot displace a complete one.
 
         Args:
-            data: Processed observation rows
+            data: Processed observation rows, one per observation
 
         Returns:
-            The rows in their original order, with true duplicates removed
+            The rows in their original order, with duplicates removed
         """
         unique_rows = {}
         for row in data:
-            key = (row.get('observation_id'), tuple(row.get('_photo_list', [])))
-            if key not in unique_rows:
+            key = row.get('observation_id')
+            previous = unique_rows.get(key)
+            if previous is None or (
+                len(row.get('_photo_list', [])) > len(previous.get('_photo_list', []))
+            ):
                 unique_rows[key] = row
         return list(unique_rows.values())
 
@@ -736,7 +837,11 @@ class iNaturalistDownloader:
                 export_row[f'Encounter.mediaAsset{i}.license'] = (
                     license_list[i] if i < len(license_list) else None
                 )
-            export_rows.append(export_row)
+            # Applied to every cell, exactly as the review page's escapeCSV()
+            # does, so the two export paths cannot disagree about any field.
+            export_rows.append(
+                {k: neutralize_formula(v) for k, v in export_row.items()}
+            )
 
         # Build fieldnames with dynamic photo columns
         fieldnames = [
@@ -867,6 +972,18 @@ class iNaturalistDownloader:
             ]
             photo_licensed += [False] * (max_photos - len(photo_licensed))
 
+            # Whether the reviewer may split this observation at all. Kept in
+            # Python with the rest of the media/biology rules -- the browser only
+            # holds state. More than one file is not sufficient: an animated GIF
+            # is one photo whose frames were extracted to N files, and splitting
+            # those would emit N Encounters of one animal in one instant (see
+            # _split_eligible in process_observations).
+            #
+            # can_split False must imply initially_split False, or isSplit()
+            # would start a row split that no button can undo, so derive one from
+            # the other rather than restating the condition.
+            can_split = len(photo_list) > 1 and not row.get('_gif_frames_extracted', False)
+
             # Build observation object
             obs_data = {
                 'observation_id': row.get('observation_id'),
@@ -887,7 +1004,8 @@ class iNaturalistDownloader:
                 'project_name': row.get('Encounter.project0.researchProjectName'),
                 'project_owner': row.get('Encounter.project0.ownerUsername'),
                 'sighting_id': row.get('_sighting_id'),
-                'initially_split': bool(row.get('_split_eligible')) and len(photo_list) > 1,
+                'can_split': can_split,
+                'initially_split': bool(row.get('_split_eligible')) and can_split,
                 'photo_licensed': photo_licensed,
                 'observer': row.get('observer'),
                 'quality_grade': row.get('quality_grade'),
@@ -1475,6 +1593,10 @@ class iNaturalistDownloader:
     <script>
         // Observation data
         const observations = {observations_json_str};
+        // The width every observation's photos / licenses / photo_licensed array
+        // is padded to. No logic branches on it any more -- the Split column is
+        // gated on can_split -- but it names the padding width those arrays
+        // share, and it is the value tests use to prove the padding happened.
         const maxPhotos = {max_photos};
         const socialSplitMode = {social_split_js};
 
@@ -1492,9 +1614,18 @@ class iNaturalistDownloader:
             return splitState.get(obs.observation_id);
         }}
 
+        // Whether the Split column exists on this page at all. Gates the <th>
+        // reveal AND the per-row <td> together -- they must never disagree, or
+        // the body carries a cell the head does not show. Driven by can_split,
+        // not by maxPhotos: a page whose only multi-file observation is an
+        // animated GIF has nothing splittable and so needs no column.
+        const splitColumnShown = observations.some(o => o.can_split);
+
         function toggleSplit(observationId) {{
             const obs = observations.find(o => o.observation_id === observationId);
-            if (!obs || obs.photo_count <= 1) return;
+            // can_split, not photo_count: Python already decided (an animated
+            // GIF's frames are one photo, and must not become N Encounters).
+            if (!obs || !obs.can_split) return;
             splitState.set(observationId, !isSplit(obs));
             renderObservations();
             updateStats();
@@ -1558,7 +1689,7 @@ class iNaturalistDownloader:
         function initializeSplitColumn() {{
             // Only useful when something can actually be split.
             const header = document.getElementById('split-header');
-            if (header && maxPhotos > 1) header.style.display = '';
+            if (header && splitColumnShown) header.style.display = '';
         }}
 
         function renderObservations() {{
@@ -1779,9 +1910,9 @@ class iNaturalistDownloader:
             // at all -- initializeSplitColumn() keeps its <th> hidden when nothing
             // on the page can be split, and an unconditional cell here would leave
             // such a page with 12 <td> under 11 visible <th>.
-            if (maxPhotos > 1) {{
+            if (splitColumnShown) {{
                 const tdSplit = document.createElement('td');
-                if (obs.photo_count > 1) {{
+                if (obs.can_split) {{
                     const btn = document.createElement('button');
                     btn.className = 'btn-split' + (isSplit(obs) ? ' split' : '');
                     btn.textContent = isSplit(obs) ? 'Unsplit' : 'Split';

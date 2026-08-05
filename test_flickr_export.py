@@ -107,6 +107,47 @@ def test_write_csv_pads_rows_with_differing_photo_counts(tmp_path):
     assert rows[1]["Encounter.mediaAsset1"] == "b.jpg"
 
 
+def test_write_csv_neutralises_spreadsheet_formulas(tmp_path):
+    """The browser export has always guarded formulas; write_csv did not.
+
+    Flickr titles and descriptions are user text and reach this CSV verbatim, so
+    a value beginning "=", "+", "-", "@", TAB or CR is a live formula the moment
+    a biologist opens the file. The guard must leave genuine negative numbers
+    alone -- every southern latitude in the file starts with "-".
+    """
+    d = _downloader(tmp_path)
+    d.write_csv([_row(
+        "123",
+        **{
+            "Encounter.verbatimLocality": "-Somewhere odd",
+            "Encounter.sightingRemarks": '=HYPERLINK("http://evil")',
+            "observer": "@someone",
+        },
+    )], "out.csv")
+
+    with open(tmp_path / "out.csv", newline="", encoding="utf-8") as fh:
+        row = next(csv.DictReader(fh))
+
+    assert row["Encounter.verbatimLocality"] == "'-Somewhere odd"
+    assert row["Encounter.sightingRemarks"] == '\'=HYPERLINK("http://evil")'
+    assert row["observer"] == "'@someone"
+    # Real coordinates stay numeric, and benign values are untouched.
+    assert row["Encounter.decimalLatitude"] == "-16.5"
+    assert row["Encounter.decimalLongitude"] == "-56.2"
+    assert row["scientific_name"] == "Panthera onca"
+    assert row["Encounter.mediaAsset0"] == "flickr_123.jpg"
+
+
+def test_neutralize_formula_matches_the_browser_rule():
+    """This module's copy of the rule must not drift from the other three."""
+    for value in ("=1+1", "+1", "-Somewhere odd", "@user", "\tlead", "\rlead", "-16.5."):
+        assert flickr_tools.neutralize_formula(value) == "'" + value, value
+    for value in ("-16.5", "-56", "0", "3.14", ".5", "-.5", "Poconé", "", "CC0"):
+        assert flickr_tools.neutralize_formula(value) == value, value
+    assert flickr_tools.neutralize_formula(None) is None
+    assert flickr_tools.neutralize_formula(-16.5) == -16.5
+
+
 def test_safe_float_never_raises_on_api_junk():
     assert _safe_float("-16.5") == -16.5
     assert _safe_float(0) == 0.0
