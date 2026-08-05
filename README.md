@@ -217,7 +217,7 @@ python3 inat-download-new-species-sightings.py \
 For highly social species where multiple individuals may appear in the same observation, use `--social-split-observations` to create one Encounter per photo:
 
 ```bash
-# Split multi-photo observations into separate encounters (use with --html-review for merge control)
+# Split multi-photo observations into separate encounters (use with --html-review to review and adjust the split per observation)
 python3 inat-download-new-species-sightings.py \
   --species "weedy seadragon" \
   --days 30 \
