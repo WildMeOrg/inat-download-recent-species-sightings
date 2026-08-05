@@ -646,11 +646,13 @@ def test_copy_csv_reports_failure_instead_of_throwing(tmp_path):
         const unavailable = {
             message: __byId['copy-success'].textContent,
             shown: __byId['copy-success'].classList.contains('show'),
+            isError: __byId['copy-success'].classList.contains('copy-error'),
         };
 
         // 2. Present but rejecting, as a blocked file:// page does.
         let called = false;
         let blockedMessage = null;
+        let blockedIsError = null;
         navigator.clipboard = {
             writeText: () => { called = true; return Promise.reject(new Error('blocked')); },
         };
@@ -660,6 +662,7 @@ def test_copy_csv_reports_failure_instead_of_throwing(tmp_path):
         // Let the rejection handler run, then exercise the success path too.
         Promise.resolve().then(() => {}).then(() => {}).then(() => {
             blockedMessage = __byId['copy-success'].textContent;
+            blockedIsError = __byId['copy-success'].classList.contains('copy-error');
             navigator.clipboard = { writeText: () => Promise.resolve() };
             __byId['copy-success'].textContent = '';
             copyCSV();
@@ -668,7 +671,9 @@ def test_copy_csv_reports_failure_instead_of_throwing(tmp_path):
                 unavailable: unavailable,
                 writeTextCalled: called,
                 blocked: blockedMessage,
+                blockedIsError: blockedIsError,
                 success: __byId['copy-success'].textContent,
+                successIsError: __byId['copy-success'].classList.contains('copy-error'),
             }));
         });
     """)
@@ -678,10 +683,19 @@ def test_copy_csv_reports_failure_instead_of_throwing(tmp_path):
         "the message must point at the working alternative"
     )
     assert result["unavailable"]["shown"] is True, "the banner was never shown"
+    assert result["unavailable"]["isError"] is True, (
+        "a missing-clipboard failure must not render in the green success palette"
+    )
     assert result["writeTextCalled"] is True
     assert "blocked" in result["blocked"].lower()
     assert "Download CSV File" in result["blocked"]
+    assert result["blockedIsError"] is True, (
+        "a rejected clipboard write must not render in the green success palette"
+    )
     assert result["success"] == "CSV content copied to clipboard!"
+    assert result["successIsError"] is False, (
+        "a successful copy must clear any .copy-error left over from a prior failure"
+    )
 
 
 def test_no_selection_keys_are_seeded_beyond_a_photo_count(tmp_path):

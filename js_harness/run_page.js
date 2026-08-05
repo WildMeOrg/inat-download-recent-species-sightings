@@ -43,6 +43,11 @@ function makeElement(tag) {
       add(...c) { c.forEach(x => el.classList._set.add(x)); },
       remove(...c) { c.forEach(x => el.classList._set.delete(x)); },
       contains(c) { return el.classList._set.has(c); },
+      toggle(c, force) {
+        const shouldAdd = force !== undefined ? Boolean(force) : !el.classList._set.has(c);
+        if (shouldAdd) el.classList._set.add(c); else el.classList._set.delete(c);
+        return shouldAdd;
+      },
     },
     appendChild(child) { el.children.push(child); return child; },
 

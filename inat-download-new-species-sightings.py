@@ -829,13 +829,15 @@ class iNaturalistDownloader:
             #
             # Note this list is sized to photo_list, NOT padded to max_photos the
             # way photos / licenses / photo_licensed are, and that asymmetry is
-            # deliberate rather than an oversight. Those three are padded because
-            # the CSV writer walks a fixed column count that spans every row on
-            # the page. Nothing walks all_photo_paths that way: it is only ever
-            # indexed by a photoIndex already known to be < photo_count, so
-            # padding it would add slots no code path can reach. Index alignment
-            # with photo_list is the invariant that matters; equal length with
-            # photos is not.
+            # deliberate rather than an oversight. Those three are padded to a
+            # common length because they are index-paired with each other and
+            # read by index (photos[i] / licenses[i] / photo_licensed[i] must
+            # describe the same photo i); a short array would silently misalign
+            # which photo is considered licensed. Nothing walks all_photo_paths
+            # that way: it is only ever indexed by a photoIndex already known to
+            # be < photo_count, so padding it would add slots no code path can
+            # reach. Index alignment with photo_list is the invariant that
+            # matters; equal length with photos is not.
             all_photo_paths = [
                 f"photos/{photo_filename}"
                 if (self.photos_dir / photo_filename).exists() else None
@@ -1272,6 +1274,14 @@ class iNaturalistDownloader:
 
         .copy-success.show {{
             display: block;
+        }}
+
+        /* Failure messages (clipboard missing/blocked) reuse #copy-success --
+           without this modifier they would render in the success palette above,
+           telling the reviewer their copy worked when it did not. */
+        .copy-success.copy-error {{
+            background: #f8d7da;
+            color: #721c24;
         }}
 
         .modal {{
@@ -1961,9 +1971,12 @@ class iNaturalistDownloader:
             return str;
         }}
 
-        function flashCopyStatus(message) {{
+        function flashCopyStatus(message, isError) {{
             const success = document.getElementById('copy-success');
             success.textContent = message;
+            // Explicit Boolean() so a success call (isError omitted) clears any
+            // .copy-error left over from a previous failed attempt.
+            success.classList.toggle('copy-error', Boolean(isError));
             success.classList.add('show');
             setTimeout(() => {{
                 success.classList.remove('show');
@@ -1980,7 +1993,7 @@ class iNaturalistDownloader:
             const clipboard = navigator.clipboard;
             if (!clipboard || typeof clipboard.writeText !== 'function') {{
                 flashCopyStatus('Clipboard is unavailable in this browser context. '
-                    + 'Use "Download CSV File" instead.');
+                    + 'Use "Download CSV File" instead.', true);
                 return;
             }}
 
@@ -1988,7 +2001,7 @@ class iNaturalistDownloader:
                 flashCopyStatus('CSV content copied to clipboard!');
             }}).catch(() => {{
                 flashCopyStatus('The browser blocked clipboard access. '
-                    + 'Use "Download CSV File" instead.');
+                    + 'Use "Download CSV File" instead.', true);
             }});
         }}
 
