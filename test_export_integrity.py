@@ -263,16 +263,42 @@ def test_csv_neutralises_spreadsheet_formulas_in_free_text():
 
 
 def test_neutralize_formula_matches_the_browser_rule():
-    """The rule is written out four times (two Python, two JavaScript).
+    """The rule is written out five times (two Python, three JavaScript).
 
     Pinning the boundary cases here means the Python copies cannot drift from
     the documented rule silently -- particularly the numeric exemption, which is
     the only thing keeping every southern latitude out of quotes.
+
+    The last two groups are the cases where a *plausible* Python regex diverges
+    from JavaScript while every ASCII test still passes:
+
+      re.ASCII -- Python's \\d matches every Unicode decimal digit, JavaScript's
+        matches 0-9 only. Without the flag "-٣" is a number to Python and a
+        formula to the browser, so the same cell exports two different ways.
+      \\Z not $ -- Python's $ also matches just before a trailing newline,
+        JavaScript's (unflagged) $ does not. Without it "-16.5\\n" is a number
+        to Python and a formula to the browser.
     """
     for value in ("=1+1", "+1", "-Somewhere odd", "@user", "\tlead", "\rlead", "-16.5."):
         assert mod.neutralize_formula(value) == "'" + value, value
     for value in ("-16.5", "-56", "0", "3.14", ".5", "-.5", "Pantanal", "", "cc-by"):
         assert mod.neutralize_formula(value) == value, value
+
+    # Non-ASCII digits are NOT numbers to JavaScript, so they must be guarded:
+    # Arabic-Indic, Extended Arabic-Indic (Persian), Devanagari.
+    for value in ("-٣", "-۳", "-१", "+٣.٤"):
+        assert mod.neutralize_formula(value) == "'" + value, (
+            f"{value!r} was treated as a number; re.ASCII is missing, so this "
+            "value exports differently here and in the browser"
+        )
+
+    # A trailing newline stops it being a number to JavaScript.
+    for value in ("-16.5\n", "-16.5\n\n"):
+        assert mod.neutralize_formula(value) == "'" + value, (
+            f"{value!r} was treated as a number; the pattern ends in $ rather "
+            "than \\Z, so this value exports differently here and in the browser"
+        )
+
     # Non-strings come back untouched, so benign output is byte-identical.
     assert mod.neutralize_formula(None) is None
     assert mod.neutralize_formula(-16.5) == -16.5

@@ -30,15 +30,19 @@ HTTP_TIMEOUT = 30
 DOWNLOAD_TIMEOUT = 120
 MAX_RETRIES = 3
 
-# A cell a spreadsheet would evaluate rather than display. re.ASCII so \d means
-# 0-9 exactly as JavaScript's \d does -- without it "-٣" would count as a number
-# here and not in the browser.
+# A cell a spreadsheet would evaluate rather than display. Two details keep this
+# byte-for-byte equivalent to the JavaScript copies rather than merely similar:
+#   re.ASCII -- Python's \d matches every Unicode decimal digit and JavaScript's
+#     matches 0-9, so without it "-٣" is a number here and a formula there.
+#   \Z rather than $ -- Python's $ also matches just before a trailing newline
+#     and JavaScript's (unflagged) $ does not, so "-16.5\n" would be left alone
+#     here and prefixed there.
 _FORMULA_LEAD_CHARS = ('=', '+', '-', '@', '\t', '\r')
-_PLAIN_NUMBER_RE = re.compile(r'^-?\d*\.?\d+$', re.ASCII)
+_PLAIN_NUMBER_RE = re.compile(r'^-?\d*\.?\d+\Z', re.ASCII)
 
 
 def neutralize_formula(value: Any) -> Any:
-    """
+    r"""
     Prefix an apostrophe to a value a spreadsheet would treat as a formula.
 
     iNaturalist free text (place_guess, common names, user logins) reaches the
@@ -49,16 +53,29 @@ def neutralize_formula(value: Any) -> Any:
     -- are left alone, so this must test for a leading formula character AND for
     the value not being a plain number.
 
-    FOUR COPIES OF THIS RULE EXIST and must stay identical, or the same
+    FIVE COPIES OF THIS RULE EXIST and must stay identical, or the same
     observation exports differently depending on which button the reviewer
     pressed (measured once: `-Somewhere odd` from the direct CSV against
     `'-Somewhere odd` from the review page):
-      1. here, for this module's write_csv
-      2. neutralize_formula() in inat-mcp-server/flickr_tools.py -- a separate
+      1. here (:40), for this module's write_csv
+      2. neutralize_formula() in inat-mcp-server/flickr_tools.py:50 -- a separate
          copy on purpose: the MCP server must not import this hyphenated
          top-level script, and this script must not depend on the server package
-      3. escapeCSV() in this module's generated review page
-      4. the escape() closure in flickr_tools' generated review page
+      3. escapeCSV() in this module's generated review page (:2113)
+      4. the escape() closure in flickr_tools' generated review page (:1196)
+      5. the escape() closure in youtube_tools' generated CSV export (:1394)
+
+    Copies 3-5 are ANONYMOUS closures, so no identifier finds them and grepping
+    for a function name silently under-reports (this census said "four" until a
+    reviewer counted). Audit all five with:
+
+        grep -rn "_FORMULA_LEAD_CHARS = \|\[=+" \
+            inat-download-new-species-sightings.py \
+            inat-mcp-server/flickr_tools.py inat-mcp-server/youtube_tools.py
+
+    Expect SEVEN hits: the five copies plus this same command quoted in the two
+    Python docstrings. The line numbers listed above are indicative and drift;
+    the grep is the authoritative census.
 
     Args:
         value: Any CSV cell value

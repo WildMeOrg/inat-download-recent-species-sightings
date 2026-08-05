@@ -139,11 +139,30 @@ def test_write_csv_neutralises_spreadsheet_formulas(tmp_path):
 
 
 def test_neutralize_formula_matches_the_browser_rule():
-    """This module's copy of the rule must not drift from the other three."""
+    """This module's copy of the rule must not drift from the other four.
+
+    The last two groups are the cases where a plausible Python regex diverges
+    from JavaScript while every ASCII case still passes: Python's \\d matches
+    all Unicode decimal digits (so re.ASCII is required), and Python's $ also
+    matches before a trailing newline (so the pattern must end in \\Z). Either
+    omission makes the same cell export one way here and another in the browser.
+    """
     for value in ("=1+1", "+1", "-Somewhere odd", "@user", "\tlead", "\rlead", "-16.5."):
         assert flickr_tools.neutralize_formula(value) == "'" + value, value
     for value in ("-16.5", "-56", "0", "3.14", ".5", "-.5", "Poconé", "", "CC0"):
         assert flickr_tools.neutralize_formula(value) == value, value
+
+    for value in ("-٣", "-۳", "-१", "+٣.٤"):
+        assert flickr_tools.neutralize_formula(value) == "'" + value, (
+            f"{value!r} was treated as a number; re.ASCII is missing, so this "
+            "value exports differently here and in the browser"
+        )
+    for value in ("-16.5\n", "-16.5\n\n"):
+        assert flickr_tools.neutralize_formula(value) == "'" + value, (
+            f"{value!r} was treated as a number; the pattern ends in $ rather "
+            "than \\Z, so this value exports differently here and in the browser"
+        )
+
     assert flickr_tools.neutralize_formula(None) is None
     assert flickr_tools.neutralize_formula(-16.5) == -16.5
 
