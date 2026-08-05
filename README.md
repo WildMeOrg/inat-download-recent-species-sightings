@@ -38,8 +38,7 @@ rather than asserting. See `manual_checks/README.md`.
   - License information prominently displayed in table
 - Includes observation metadata: date, location, observer, quality grade, etc.
 - Custom location ID and submitter ID assignment for Wildbook bulk import
-- **Social species support**: Split multi-photo observations into separate encounters while preserving relationships via shared Sighting ID
-- Respects iNaturalist "single subject" annotations to prevent inappropriate splitting
+- **Social species support**: split multi-photo observations into separate encounters sharing a Sighting ID, with a per-observation **Split/Unsplit** control in the HTML review page so any observation can be split or rejoined by hand
 - Handles pagination automatically for large result sets
 - Uses only Python standard library (no external dependencies)
 
@@ -369,7 +368,7 @@ The CSV file contains the following columns:
 | Encounter.livingStatus | Living status of organism ("alive", "dead", or empty) |
 | Encounter.submitterID | Custom submitter ID (set via --use-submitterID) |
 | Encounter.state | Encounter approval state (always "unapproved" for new imports) |
-| Sighting.sightingID | UUID linking related encounters from same observation (only populated when --social-split-observations is used) |
+| Sighting.sightingID | UUID linking related encounters from the same observation (populated when a row is split -- via `--social-split-observations` in CSV mode, or via the review page's per-observation Split button in HTML review mode) |
 | observer | iNaturalist username of observer |
 | quality_grade | Quality grade (research, needs_id, casual) |
 | url | Link to observation on iNaturalist |
