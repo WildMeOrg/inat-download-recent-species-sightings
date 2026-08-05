@@ -197,7 +197,7 @@ class iNaturalistDownloader:
 
     BASE_URL = "https://api.inaturalist.org/v1"
 
-    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None, social_split: bool = False, project_owner: str = None):
+    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None, social_split: bool = False, project_owner: str = None, start_date: str = None, end_date: str = None):
         """
         Initialize the downloader.
 
@@ -212,6 +212,8 @@ class iNaturalistDownloader:
             submitter_id: Optional submitter ID to add to all observations in Encounter.submitterID column
             social_split: Split multi-photo observations into separate rows with shared sighting ID (default: False)
             project_owner: Optional Wildbook username to own the project (required for new projects)
+            start_date: Optional explicit window start, YYYY-MM-DD (overrides days_back)
+            end_date: Optional explicit window end, YYYY-MM-DD (defaults to today)
         """
         self.output_dir = Path(output_dir)
         self.days_back = days_back
@@ -224,6 +226,15 @@ class iNaturalistDownloader:
         self.submitter_id = submitter_id
         self.social_split = social_split
         self.project_owner = project_owner
+        # Validate here rather than at first use: a malformed date otherwise
+        # surfaces as an empty result set after a long download.
+        self.start_date = self._parse_date(start_date, '--start-date')
+        self.end_date = self._parse_date(end_date, '--end-date')
+        if self.start_date and self.end_date and self.start_date > self.end_date:
+            raise ValueError(
+                f"--start-date ({start_date}) is after --end-date ({end_date}); "
+                f"iNaturalist would return nothing for that window"
+            )
         self.photos_dir = self.output_dir / "photos"
 
         # Create directories if they don't exist
@@ -234,10 +245,50 @@ class iNaturalistDownloader:
         """GET a JSON document using this downloader's rate limit."""
         return fetch_json(url, rate_limit=self.rate_limit)
 
+    @staticmethod
+    def _parse_date(value: str, flag: str) -> datetime:
+        """
+        Parse a YYYY-MM-DD command-line date, or None when not supplied.
+
+        Args:
+            value: The raw string, or None
+            flag: The flag name, for the error message
+
+        Returns:
+            A datetime, or None
+
+        Raises:
+            ValueError: If the value is not a valid YYYY-MM-DD date
+        """
+        if value is None:
+            return None
+        try:
+            return datetime.strptime(value, "%Y-%m-%d")
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{flag} must be a date in YYYY-MM-DD form, got {value!r}"
+            )
+
     def get_date_range(self) -> tuple:
-        """Calculate the date range for the search."""
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=self.days_back)
+        """
+        Calculate the date range for the search.
+
+        Explicit --start-date / --end-date win over --days, which can only ever
+        express a window ending today and so cannot describe a closed historical
+        range. The values map straight onto iNaturalist's d1/d2, which are
+        inclusive whole dates -- so a request for 00:00 on the start day through
+        23:59 on the end day is exactly this window.
+
+        Returns:
+            (start, end) as YYYY-MM-DD strings
+        """
+        end_date = self.end_date or datetime.now()
+        if self.start_date:
+            start_date = self.start_date
+        else:
+            # An --end-date without a --start-date still spans days_back before
+            # it, rather than silently widening to every observation ever.
+            start_date = end_date - timedelta(days=self.days_back)
         return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
 
     def generate_project_name(self, genus: str, specific_epithet: str) -> str:
@@ -2422,6 +2473,22 @@ Examples:
     )
 
     parser.add_argument(
+        '--start-date',
+        type=str,
+        default=None,
+        help='Explicit window start, YYYY-MM-DD. Overrides --days. '
+             'Use with --end-date to backfill a closed historical range.'
+    )
+
+    parser.add_argument(
+        '--end-date',
+        type=str,
+        default=None,
+        help='Explicit window end, YYYY-MM-DD (default: today). Inclusive, so '
+             '--end-date 2025-06-20 covers all of 20 June 2025.'
+    )
+
+    parser.add_argument(
         '--output',
         type=str,
         default='./inat_data',
@@ -2486,19 +2553,30 @@ Examples:
         print("Error: --rate-limit must be non-negative")
         sys.exit(1)
 
-    # Create downloader and run
-    downloader = iNaturalistDownloader(
-        output_dir=args.output,
-        days_back=args.days,
-        species_list=args.species,
-        rate_limit=args.rate_limit,
-        html_review=args.html_review,
-        place=args.place,
-        location_id=args.use_locationID,
-        submitter_id=args.use_submitterID,
-        social_split=args.social_split_observations,
-        project_owner=args.project_owner
-    )
+    if args.start_date and args.end_date and '--days' in sys.argv:
+        print("Note: --days is ignored when both --start-date and --end-date are given.")
+
+    # Create downloader and run. Construction validates the date window, so a
+    # malformed --start-date/--end-date must exit cleanly here rather than
+    # surfacing as a traceback before anything has been downloaded.
+    try:
+        downloader = iNaturalistDownloader(
+            output_dir=args.output,
+            days_back=args.days,
+            species_list=args.species,
+            rate_limit=args.rate_limit,
+            html_review=args.html_review,
+            place=args.place,
+            location_id=args.use_locationID,
+            submitter_id=args.use_submitterID,
+            social_split=args.social_split_observations,
+            project_owner=args.project_owner,
+            start_date=args.start_date,
+            end_date=args.end_date
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
     try:
         downloader.run()
