@@ -4,7 +4,7 @@ An MCP (Model Context Protocol) server that enables AI assistants like Claude to
 
 ## Features
 
-This MCP server provides AI agents with five powerful tools:
+This MCP server provides AI agents with six tools:
 
 ### iNaturalist Tools
 
@@ -51,6 +51,18 @@ Search YouTube using multiple language variants of a species name:
 - Shows which language matched each video
 - Optional keyword filtering
 - **Requires:** YOUTUBE_API_KEY environment variable
+
+### Flickr Tools
+
+### 6. `download_flickr_observations`
+Download geo-tagged, CC-licensed wildlife photos from Flickr:
+- Multi-species support, resolved to iNaturalist taxonomy
+- Only Creative Commons / public-domain licenses
+- GPS coordinates and Flickr's location hierarchy
+- `max_results` caps photos per species (default 500)
+- `html_review` (default true) produces a review page; false writes the CSV directly
+- **Requires:** FLICKR_API_KEY environment variable — get one at
+  https://www.flickr.com/services/api/misc.api_keys.html
 
 ## Installation
 

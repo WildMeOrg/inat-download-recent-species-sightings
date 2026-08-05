@@ -2,6 +2,23 @@
 
 A Python utility for downloading recent observations of specific species from iNaturalist, including observation data (CSV) and photos. Created for the Wildbook program to help incorporate iNaturalist sightings into Wildbook via bulk import.
 
+## Scope
+
+The supported, maintained entry point is **`inat-download-new-species-sightings.py`** — the
+iNaturalist → Wildbook downloader. The `inat-mcp-server/` directory (YouTube and Flickr search)
+is legacy and **not** part of the Wildbook import workflow; it is kept for reference only and may
+be removed in a future release. The experimental CLIP image filtering has been removed — it was
+never wired to a command-line flag and had no callers.
+
+Automated tests live at the repo root and need no network or API keys:
+
+```bash
+python3 -m pytest
+```
+
+`manual_checks/` holds live-API diagnostic scripts that require credentials and report by printing
+rather than asserting. See `manual_checks/README.md`.
+
 ## Features
 
 - Downloads observations from iNaturalist for specified species
@@ -21,8 +38,7 @@ A Python utility for downloading recent observations of specific species from iN
   - License information prominently displayed in table
 - Includes observation metadata: date, location, observer, quality grade, etc.
 - Custom location ID and submitter ID assignment for Wildbook bulk import
-- **Social species support**: Split multi-photo observations into separate encounters while preserving relationships via shared Sighting ID
-- Respects iNaturalist "single subject" annotations to prevent inappropriate splitting
+- **Social species support**: split multi-photo observations into separate encounters sharing a Sighting ID, with a per-observation **Split/Unsplit** control in the HTML review page so any observation can be split or rejoined by hand
 - Handles pagination automatically for large result sets
 - Uses only Python standard library (no external dependencies)
 
@@ -62,7 +78,7 @@ python3 inat-download-new-species-sightings.py --species SPECIES_NAME [OPTIONS]
 - `--place`: Filter observations by place (e.g., "California", "Oregon", "United States")
 - `--use-locationID`: Location ID to add to Encounter.locationID column for all observations
 - `--use-submitterID`: Submitter ID to add to Encounter.submitterID column for all observations
-- `--social-split-observations`: Split multi-photo observations into separate CSV rows (one per photo) for social species. Each photo becomes a separate Encounter, linked by a shared Sighting.sightingID. Respects iNaturalist "single subject" annotations.
+- `--social-split-observations`: Split multi-photo observations into separate CSV rows (one per photo) for social species. Each photo becomes a separate Encounter, linked by a shared Sighting.sightingID. Observations annotated "Evidence of Presence: Organism" are currently not split — see the caveat below.
 
 ### Examples
 
@@ -200,7 +216,7 @@ python3 inat-download-new-species-sightings.py \
 For highly social species where multiple individuals may appear in the same observation, use `--social-split-observations` to create one Encounter per photo:
 
 ```bash
-# Split multi-photo observations into separate encounters (use with --html-review for merge control)
+# Split multi-photo observations into separate encounters (use with --html-review to review and adjust the split per observation)
 python3 inat-download-new-species-sightings.py \
   --species "weedy seadragon" \
   --days 30 \
@@ -213,20 +229,62 @@ python3 inat-download-new-species-sightings.py \
 - Observations with multiple photos are split into separate CSV rows (one per photo)
 - Each row represents a single Encounter in Wildbook
 - All rows from the same observation share a common `Sighting.sightingID` UUID to preserve the relationship
-- Observations marked with iNaturalist's "single subject" annotation are NOT split (all photos kept together)
+- Observations carrying iNaturalist's "Evidence of Presence: Organism" annotation are NOT split (all photos kept together)
 - Single-photo observations remain as single rows
+- Observations whose media includes an animated GIF are NOT split. The utility expands an
+  animated GIF into one JPEG per frame, but those frames are one iNaturalist photo of one
+  animal at one instant; splitting them would create an Encounter per frame and every one
+  of them would match every other
 
 **Example result:**
 - Original: 1 observation with 4 photos → 4 CSV rows (each with 1 photo, same Sighting.sightingID)
-- "Single subject" observation with 3 photos → 1 CSV row (all 3 photos together)
+- "Evidence of Presence: Organism" observation with 3 photos → 1 CSV row (all 3 photos together)
+- Observation whose only photo is a 30-frame animated GIF → 1 CSV row (all 30 frames together)
 
-**HTML Review Mode Features (when using --social-split-observations):**
-- **Alternating row colors**: Rows from the same original observation are color-coded (alternating light green and white backgrounds) to help you identify which rows belong together
-- **Merge button**: Each split observation has a "Merge" button. Click it to re-combine all photos from that observation back into a single row
-  - Merged rows are highlighted with a green border and background
-  - The "Merge" button becomes "Unmerge" - click again to undo the merge
-  - Merged rows appear as a single row in the exported CSV with all photos combined
-  - Unmerged rows remain as separate CSV rows (one per photo)
+> **Open question — the split-suppression rule is probably too broad.** This
+> code was written believing iNaturalist has a "single subject" annotation
+> meaning one individual is pictured. It does not. What it actually reads is
+> the *Evidence of Presence* attribute with value *Organism*, which only says
+> the evidence is the animal itself rather than a track, scat, or feather — it
+> says nothing about how many individuals are present. Because most
+> wild-animal observations are annotated that way, splitting is suppressed for
+> the common case. Decide whether to (a) drop the suppression and split every
+> multi-photo observation, or (b) keep it and rename the flag to reflect what
+> it does. The behaviour is unchanged for now so no existing workflow shifts
+> underfoot.
+>
+> **Partially mitigated:** the per-observation Split button means this suppression is no
+> longer the last word — a reviewer can split any observation the flag skipped. The
+> question of what the flag's default *should* be is still open.
+
+**HTML Review Mode Features:**
+
+Every observation with more than one photo gets a **Split** button, whether or not
+`--social-split-observations` was used. Press it and the row expands into one row per
+photo, each with its own checkbox, all sharing one `Sighting.sightingID` so Wildbook
+still records them as a single sighting. Deselect any photo to leave it out entirely.
+**Unsplit** collapses the rows back together.
+
+The one exception is an observation whose media came from an animated GIF: its frames are
+one photo, so it gets no Split button and the Split column disappears entirely on a page
+where nothing else can be split. See the CSV-mode note above.
+
+- Rows from the same observation are colour-coded (alternating backgrounds) so you can
+  see which belong together
+- A split row is selected by default if *its own* photo carries a license, so splitting
+  is a way to keep the CC-licensed photos from an observation that is otherwise
+  deselected because one photo is all-rights-reserved
+- `--social-split-observations` now only sets the *starting* state: observations it would
+  have split start split, and you can Unsplit any of them
+- Split state lives in the page only. Reloading the file starts from the defaults again.
+- **Select All** overrides the per-photo license default above: it arms every visible row,
+  including a split row whose own photo carries no license. It is a bulk override, not a
+  way to double-check what the defaults chose.
+- The **Total Observations** stat counts display rows, not original iNaturalist
+  observations — splitting a 4-photo observation into 4 rows makes the count go up by 3.
+  It is the right number for "rows about to be exported," but no longer a literal count of
+  observations. **GPS Obscured** is unaffected: it still counts original observations, so
+  the two stats can diverge while any row is split.
 
 ## Output Structure
 
@@ -314,11 +372,12 @@ The CSV file contains the following columns:
 | Encounter.decimalLatitude | Latitude coordinate in decimal degrees |
 | Encounter.decimalLongitude | Longitude coordinate in decimal degrees |
 | Encounter.verbatimLocality | Location description as entered by observer |
+| Encounter.otherCatalogNumbers | External source reference `iNaturalist:<observation_id>` — lets Wildbook detect whether this observation was already imported |
 | Encounter.locationID | Custom location ID (set via --use-locationID) |
 | Encounter.livingStatus | Living status of organism ("alive", "dead", or empty) |
 | Encounter.submitterID | Custom submitter ID (set via --use-submitterID) |
 | Encounter.state | Encounter approval state (always "unapproved" for new imports) |
-| Sighting.sightingID | UUID linking related encounters from same observation (only populated when --social-split-observations is used) |
+| Sighting.sightingID | UUID linking related encounters from the same observation (populated when a row is split -- via `--social-split-observations` in CSV mode, or via the review page's per-observation Split button in HTML review mode) |
 | observer | iNaturalist username of observer |
 | quality_grade | Quality grade (research, needs_id, casual) |
 | url | Link to observation on iNaturalist |
@@ -330,6 +389,21 @@ The CSV file contains the following columns:
 | Encounter.mediaAsset2... | Additional photo columns (dynamically created) |
 
 **Note:** The number of `Encounter.mediaAsset` columns is determined by the maximum number of photos across all observations in the dataset. Observations with fewer photos will have empty cells in the extra columns.
+
+**Note on leading apostrophes.** iNaturalist free text (localities, common names, usernames)
+reaches this file verbatim, and a value beginning `=`, `+`, `-`, `@`, a tab or a carriage return
+is a live formula to Excel and Google Sheets. Every export path — the direct CSV, the review
+page's Download/Copy buttons, and the Flickr exporter — prefixes such a value with an apostrophe
+so it displays as text. Genuine negative numbers are left alone, so southern latitudes and
+western longitudes still export as numbers. If you see a locality like `'-Somewhere odd`, the
+apostrophe is that guard rather than part of the observation.
+
+## Using the output with Wildbook
+
+The generated CSV and `photos/` folder are ready for Wildbook's **Bulk Import** page: upload the
+photo folder, then the CSV. Every encounter is written as `unapproved` so your team can verify it
+before it enters analyses. The `Encounter.otherCatalogNumbers` column carries an
+`iNaturalist:<id>` back-reference so a record can later be recognised as already imported.
 
 ### Photo Files
 

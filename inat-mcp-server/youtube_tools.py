@@ -4,8 +4,14 @@ YouTube Wildlife Video Search Tools
 Searches YouTube for wildlife videos by species name (any species)
 """
 
+import html
 import os
+import re
 from datetime import datetime, timedelta
+
+# Without an explicit timeout urllib blocks forever on a server that accepts the
+# connection and then goes quiet, wedging the whole MCP server.
+HTTP_TIMEOUT = 30
 from typing import List, Dict, Any, Optional
 import urllib.request
 import urllib.parse
@@ -85,7 +91,7 @@ class YouTubeSearcher:
         url = f"{self.base_url}/search?" + urllib.parse.urlencode(params)
 
         try:
-            with urllib.request.urlopen(url) as response:
+            with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as response:
                 data = json.loads(response.read().decode())
 
             videos = []
@@ -191,7 +197,7 @@ class YouTubeSearcher:
         url = f"{self.base_url}/videos?" + urllib.parse.urlencode(params)
 
         try:
-            with urllib.request.urlopen(url) as response:
+            with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as response:
                 data = json.loads(response.read().decode())
 
             if not data.get('items'):
@@ -269,6 +275,54 @@ def format_video_results(videos: List[Dict[str, Any]], include_descriptions: boo
 
     return result
 
+def _json_for_script_block(payload: Any) -> str:
+    """
+    Serialize JSON that is safe to inline inside a <script> element.
+
+    json.dumps does not escape "<", so a video title or description containing
+    "</script>" would close the block early and blank the whole report.
+    """
+    return (
+        json.dumps(payload, ensure_ascii=True)
+        .replace('<', '\\u003c')
+        .replace('>', '\\u003e')
+        .replace('&', '\\u0026')
+    )
+
+
+def _matches_any_word(text: str, keywords: List[str]) -> bool:
+    """
+    Whole-word/phrase keyword match.
+
+    Plain `in` checks made "ai" match "thai" and "mar" match "marine", so a
+    genuine Koh Tao whale-shark video collected the -60 AI-content penalty and
+    was dropped from the report with no trace.
+    """
+    for keyword in keywords:
+        if re.search(rf'\b{re.escape(keyword)}\b', text, re.IGNORECASE):
+            return True
+    return False
+
+
+def _is_plausible_date(year: str, month: str, day: str = None) -> bool:
+    """Reject digit groups that merely look like a date ("1080-30-60fps")."""
+    try:
+        year_i, month_i = int(year), int(month)
+    except (TypeError, ValueError):
+        return False
+
+    if not 1900 <= year_i <= datetime.now().year + 1:
+        return False
+    if not 1 <= month_i <= 12:
+        return False
+    if day is not None:
+        try:
+            datetime(year_i, month_i, int(day))
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def evaluate_wild_sighting_likelihood(video: Dict[str, Any]) -> Dict[str, Any]:
     """
     Evaluate whether a video is likely a genuine wild wildlife sighting with citizen science value.
@@ -339,7 +393,7 @@ def evaluate_wild_sighting_likelihood(video: Dict[str, Any]) -> Dict[str, Any]:
     ai_channel_patterns = ['apex realms', 'ai magica', 'realistic', 'cinematic', 'wildlens',
                           'generated', 'deepseafables', 'mothers of the wild', 'primal origins']
 
-    ai_content_keywords = ['ai ', ' ai', 'sora', 'caught on camera in chicago',
+    ai_content_keywords = ['ai', 'sora', 'caught on camera in chicago',
                           'real footage in chicago', 'cinematic disaster',
                           'realistic cinematic', 'magical moment', 'eye contact',
                           'glowing tornado', 'witness', 'in awe', 'spectacular display']
@@ -347,7 +401,7 @@ def evaluate_wild_sighting_likelihood(video: Dict[str, Any]) -> Dict[str, Any]:
     if any(pattern in channel for pattern in ai_channel_patterns):
         score -= 70
         reasons.append("AI-generated content channel")
-    elif any(word in combined_text for word in ai_content_keywords):
+    elif _matches_any_word(combined_text, ai_content_keywords):
         score -= 60
         reasons.append("AI-generated or staged content")
 
@@ -427,9 +481,9 @@ def evaluate_wild_sighting_likelihood(video: Dict[str, Any]) -> Dict[str, Any]:
         reasons.append("Conservation/research content (scientific)")
 
     # Date/location specificity (indicates real observation)
-    if any(word in combined_text for word in ['oct', 'nov', 'dec', 'jan', 'feb', 'mar', 'apr', 'may', 'jun',
-                                                 'jul', 'aug', 'sep', '2025', '2024', 'today']) and \
-       any(word in combined_text for word in hotspot_locations + ['beach', 'island', 'coast', 'reef']):
+    if _matches_any_word(combined_text, ['oct', 'nov', 'dec', 'jan', 'feb', 'mar', 'apr', 'may', 'jun',
+                                         'jul', 'aug', 'sep', '2025', '2024', 'today']) and \
+       _matches_any_word(combined_text, hotspot_locations + ['beach', 'island', 'coast', 'reef']):
         score += 15
         reasons.append("Specific date/location (actual observation)")
 
@@ -446,15 +500,51 @@ def evaluate_wild_sighting_likelihood(video: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _get_dateparser():
+    """Return the dateparser module, or None when it is not installed."""
+    global _dateparser_unavailable
+    if _dateparser_unavailable:
+        return None
+    try:
+        import dateparser
+        return dateparser
+    except ImportError as e:
+        _dateparser_unavailable = True
+        print(f"Warning: dateparser unavailable ({e}); month-name and relative "
+              f"dates will not be resolved. Install with: pip install dateparser")
+        return None
+
+
+_dateparser_unavailable = False
+
 # Cache spaCy model at module level for performance
 _nlp_model = None
+_nlp_unavailable = False
 
 def _get_nlp_model():
-    """Load and cache spaCy model"""
-    global _nlp_model
+    """
+    Load and cache the spaCy model, or return None if it is unavailable.
+
+    Date extraction runs *after* the YouTube search has already spent API
+    quota. A missing spacy package or un-downloaded en_core_web_sm model used
+    to raise from here and discard the entire result set, so an install gap
+    cost real quota and returned nothing. Degrade to the regex-only path
+    instead and warn once.
+    """
+    global _nlp_model, _nlp_unavailable
+
+    if _nlp_unavailable:
+        return None
     if _nlp_model is None:
-        import spacy
-        _nlp_model = spacy.load("en_core_web_sm")
+        try:
+            import spacy
+            _nlp_model = spacy.load("en_core_web_sm")
+        except Exception as e:
+            _nlp_unavailable = True
+            print(f"Warning: spaCy NLP unavailable ({e}); falling back to regex-only "
+                  f"date extraction. Install with: pip install spacy && "
+                  f"python -m spacy download en_core_web_sm")
+            return None
     return _nlp_model
 
 
@@ -518,10 +608,6 @@ def extract_observation_date(video: Dict[str, Any]) -> str:
         "2025" -> "2025"
         "yesterday" -> "2025-11-06" (relative to published date)
     """
-    import dateparser
-    from datetime import datetime
-    import re
-
     title = video.get('title', '') or ''
     description = video.get('description', '') or ''
     published_at = video.get('published_at', '')
@@ -535,24 +621,28 @@ def extract_observation_date(video: Dict[str, Any]) -> str:
     # Combine title and description for NLP analysis
     combined_text = f"{title}. {description}"
 
-    # First try quick regex patterns for common formats before expensive NLP
+    # First try quick regex patterns for common formats before expensive NLP.
+    # These are anchored and range-checked: unanchored digit groups happily
+    # matched things like "1080-30-60fps" and "0800-12-3456", producing
+    # Encounter.year=1080 / month=30 / day=60 in the exported CSV.
     # Pattern 1: Full ISO format (2025-11-07)
-    iso_match = re.search(r'(\d{4})-(\d{2})-(\d{2})', combined_text)
-    if iso_match:
+    iso_match = re.search(r'\b(\d{4})-(\d{2})-(\d{2})\b', combined_text)
+    if iso_match and _is_plausible_date(*iso_match.groups()):
         return iso_match.group(0)  # Full date: YYYY-MM-DD
 
     # Pattern 2: Year-Month ISO (2025-10)
     year_month_iso = re.search(r'\b(\d{4})-(\d{2})\b', combined_text)
-    if year_month_iso:
+    if year_month_iso and _is_plausible_date(*year_month_iso.groups()):
         return year_month_iso.group(0)  # Partial date: YYYY-MM
 
     # Pattern 3: Common formats like "7th Oct", "Oct 7", "November 5"
     # These often lack year and spaCy may not recognize them, so handle with dateparser
     month_day_patterns = [
-        r'\b(\d{1,2})(st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|december|january|february|march|april|may|june|july|august|september|october|november|december)\b',
-        r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|december|january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(st|nd|rd|th)?\b'
+        r'\b(\d{1,2})(st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|may|june|july|august|september|october|november|december)\b',
+        r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(st|nd|rd|th)?\b'
     ]
-    for pattern in month_day_patterns:
+    dateparser = _get_dateparser()
+    for pattern in month_day_patterns if dateparser else []:
         match = re.search(pattern, combined_text, re.IGNORECASE)
         if match:
             # Use dateparser to resolve relative to published date
@@ -567,8 +657,12 @@ def extract_observation_date(video: Dict[str, Any]) -> str:
             if parsed:
                 return parsed.strftime('%Y-%m-%d')
 
-    # Use spaCy NLP for more complex date extraction
+    # Use spaCy NLP for more complex date extraction. Both NLP dependencies are
+    # optional; without them the regex results above stand and we return ''
+    # rather than throwing away the caller's already-paid-for search results.
     nlp = _get_nlp_model()
+    if nlp is None or dateparser is None:
+        return ''
     doc = nlp(combined_text)
 
     # Find DATE entities
@@ -736,15 +830,18 @@ def generate_html_report(
     search_info = ""
     if search_params:
         if 'species' in search_params:
-            search_info += f"<strong>Species:</strong> {search_params['species']}<br>"
+            search_info += f"<strong>Species:</strong> {html.escape(str(search_params['species']), quote=True)}<br>"
         if 'species_names' in search_params:
             search_info += "<strong>Languages searched:</strong> "
-            search_info += ", ".join(f"{lang}: {name}" for lang, name in search_params['species_names'].items())
+            search_info += ", ".join(
+                f"{html.escape(str(lang), quote=True)}: {html.escape(str(name), quote=True)}"
+                for lang, name in search_params['species_names'].items()
+            )
             search_info += "<br>"
         if 'days_back' in search_params:
-            search_info += f"<strong>Time period:</strong> Last {search_params['days_back']} days<br>"
+            search_info += f"<strong>Time period:</strong> Last {html.escape(str(search_params['days_back']), quote=True)} days<br>"
         if 'place' in search_params:
-            search_info += f"<strong>Location filter:</strong> {search_params['place']}<br>"
+            search_info += f"<strong>Location filter:</strong> {html.escape(str(search_params['place']), quote=True)}<br>"
 
     # Add filtering info
     search_info += f"<strong>Total videos found:</strong> {original_count}<br>"
@@ -760,11 +857,15 @@ def generate_html_report(
     video_cards = ""
     wild_count = 0
     for i, video in enumerate(videos):
-        video_id = video.get('video_id', '')
-        title = video.get('title', 'Untitled').replace('"', '&quot;').replace("'", "&#39;")
-        channel = video.get('channel_title', 'Unknown')
-        description = video.get('description', '')[:300]
-        if len(video.get('description', '')) > 300:
+        # YouTube IDs are [A-Za-z0-9_-]{11}; anything else is not embeddable
+        # and must never reach the iframe src attribute.
+        raw_video_id = video.get('video_id', '') or ''
+        video_id = raw_video_id if re.fullmatch(r'[A-Za-z0-9_-]{11}', raw_video_id) else ''
+        title = html.escape(video.get('title', 'Untitled') or 'Untitled', quote=True)
+        channel = html.escape(video.get('channel_title', 'Unknown') or 'Unknown', quote=True)
+        raw_description = video.get('description', '') or ''
+        description = html.escape(raw_description[:300], quote=True)
+        if len(raw_description) > 300:
             description += "..."
 
         pub_date = video.get('published_at', '')
@@ -777,9 +878,11 @@ def generate_html_report(
         else:
             date_str = "Unknown date"
 
-        url = video.get('url', '')
-        matched_lang = video.get('matched_language', '')
-        matched_query = video.get('matched_query', '')
+        raw_url = video.get('url', '') or ''
+        # Only http(s) links; never javascript: from API data.
+        url = html.escape(raw_url, quote=True) if raw_url.startswith(('http://', 'https://')) else ''
+        matched_lang = html.escape(video.get('matched_language', '') or '', quote=True)
+        matched_query = html.escape(video.get('matched_query', '') or '', quote=True)
 
         # Use cached evaluation from filtering step
         evaluation = video.get('_evaluation', {})
@@ -810,7 +913,16 @@ def generate_html_report(
             badge_class = 'confidence-low'
             badge_text = f'🔴 Low confidence ({score}%)'
 
-        reasons_html = '<br>• '.join(reasons) if reasons else 'No specific indicators'
+        date_str = html.escape(str(date_str), quote=True)
+        obs_date = html.escape(str(obs_date), quote=True)
+        location = {
+            **location,
+            'place_name': html.escape(str(location.get('place_name') or ''), quote=True),
+            'country': html.escape(str(location.get('country') or ''), quote=True),
+        }
+        reasons_html = '<br>• '.join(
+            html.escape(str(reason), quote=True) for reason in reasons
+        ) if reasons else 'No specific indicators'
 
         video_cards += f"""
         <div class="video-card" data-index="{i}">
@@ -835,7 +947,7 @@ def generate_html_report(
                     <p><strong>Published:</strong> {date_str}</p>
                     {f'<p><strong>Observation Date (extracted):</strong> {obs_date}</p>' if obs_date else '<p><strong>Observation Date:</strong> <em>Unknown (not found in title/description)</em></p>'}
                     {f'<p><strong>Location (extracted):</strong> {location["place_name"]}{", " + location["country"] if location["country"] and location["place_name"] else location["country"]}</p>' if location.get('place_name') or location.get('country') else '<p><strong>Location:</strong> <em>Unknown (not found in title/description)</em></p>'}
-                    {f'<p><strong>Coordinates:</strong> {location["latitude"]:.4f}, {location["longitude"]:.4f}</p>' if location.get('latitude') and location.get('longitude') else ''}
+                    {f'<p><strong>Coordinates:</strong> {location["latitude"]:.4f}, {location["longitude"]:.4f}</p>' if location.get('latitude') is not None and location.get('longitude') is not None else ''}
                     <p><strong>URL:</strong> <a href="{url}" target="_blank">{url}</a></p>
                     {f'<p><strong>Matched:</strong> {matched_query} ({matched_lang})</p>' if matched_lang else ''}
                     <div class="confidence-info">
@@ -1196,7 +1308,7 @@ def generate_html_report(
         }}
 
         function exportSelected() {{
-            const videos = {json.dumps(videos)};
+            const videos = {_json_for_script_block(videos)};
             const checkboxes = document.querySelectorAll('.video-checkbox');
             const selected = [];
 
@@ -1237,9 +1349,9 @@ def generate_html_report(
         }}
 
         function exportCSV() {{
-            const videos = {json.dumps(videos)};
+            const videos = {_json_for_script_block(videos)};
             const checkboxes = document.querySelectorAll('.video-checkbox');
-            const species = {json.dumps(search_params.get('species', '') if search_params else '')};
+            const species = {_json_for_script_block(search_params.get('species', '') if search_params else '')};
 
             // Wildbook CSV format header (matches iNaturalist export)
             let csv = 'observation_id,observed_on,Encounter.year,Encounter.month,Encounter.day,';
@@ -1275,7 +1387,15 @@ def generate_html_report(
                     const sightingID = `youtube-${{video.video_id}}`;
 
                     // Escape function for CSV fields
-                    const escape = (str) => `"${{(str || '').replace(/"/g, '""')}}"`;
+                    const escape = (value) => {{
+                        let str = String(value === null || value === undefined ? '' : value);
+                        // Neutralise spreadsheet formula injection from video text,
+                        // but leave genuine negative numbers (latitudes) alone.
+                        if (/^[=+\\-@\\t\\r]/.test(str) && !/^-?\\d*\\.?\\d+$/.test(str)) {{
+                            str = "'" + str;
+                        }}
+                        return '"' + str.replace(/"/g, '""') + '"';
+                    }};
 
                     // Build Wildbook CSV row
                     const row = [

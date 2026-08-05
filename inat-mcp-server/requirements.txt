@@ -1,15 +1,17 @@
 # MCP Server Dependencies
 mcp>=0.9.0
 
-# NLP for date extraction from YouTube video metadata
+# Image handling: animated GIF frame extraction in the iNaturalist downloader
+pillow>=10.0.0
+
+# NLP for date extraction from YouTube video metadata.
+# Both are optional at runtime: without them, date extraction falls back to the
+# regex-only path and warns, rather than discarding search results.
 spacy>=3.7.0
 dateparser>=1.2.0
 
-# Note: YouTube search tools use Python standard library for API calls (urllib, json)
-# Requires YOUTUBE_API_KEY environment variable
-# After installing requirements, download spaCy model: python -m spacy download en_core_web_sm
-
-# Optional: For CLIP-based image filtering (if implementing in the future)
-# transformers>=4.30.0
-# torch>=2.0.0
-# pillow>=10.0.0
+# The spaCy model is a separate download and is NOT installed by this file:
+#   python -m spacy download en_core_web_sm
+#
+# YouTube and Flickr tools use the standard library for API calls (urllib, json).
+# Environment variables: YOUTUBE_API_KEY, FLICKR_API_KEY

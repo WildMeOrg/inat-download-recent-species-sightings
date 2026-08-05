@@ -7,6 +7,7 @@ Provides AI agents with tools to download and process wildlife observations
 import asyncio
 import json
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any, Optional
 import os
@@ -32,6 +33,8 @@ spec = importlib.util.spec_from_file_location(
 inat_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(inat_module)
 iNaturalistDownloader = inat_module.iNaturalistDownloader
+fetch_json = inat_module.fetch_json
+split_rows_by_photo = inat_module.split_rows_by_photo
 
 # Import YouTube tools
 from youtube_tools import YouTubeSearcher, format_video_results, generate_html_report
@@ -341,20 +344,25 @@ async def handle_call_tool(
 ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
     """Handle tool execution requests."""
 
-    if name == "download_observations":
-        return await download_observations_tool(arguments or {})
-    elif name == "get_recent_species_summary":
-        return await get_species_summary_tool(arguments or {})
-    elif name == "list_place_suggestions":
-        return await list_places_tool(arguments or {})
-    elif name == "search_youtube_videos":
-        return await search_youtube_tool(arguments or {})
-    elif name == "search_youtube_multilanguage":
-        return await search_youtube_multilanguage_tool(arguments or {})
-    elif name == "download_flickr_observations":
-        return await download_flickr_tool(arguments or {})
-    else:
+    handlers = {
+        "download_observations": download_observations_tool,
+        "get_recent_species_summary": get_species_summary_tool,
+        "list_place_suggestions": list_places_tool,
+        "search_youtube_videos": search_youtube_tool,
+        "search_youtube_multilanguage": search_youtube_multilanguage_tool,
+        "download_flickr_observations": download_flickr_tool,
+    }
+
+    handler = handlers.get(name)
+    if handler is None:
         raise ValueError(f"Unknown tool: {name}")
+
+    # stdio_server() owns sys.stdout as the JSON-RPC transport. The downloaders
+    # this server drives report progress with bare print(), which would inject
+    # non-JSON lines into that stream and break the framing. Send any stdout
+    # written while a tool runs to stderr instead.
+    with redirect_stdout(sys.stderr):
+        return await handler(arguments or {})
 
 async def download_observations_tool(args: dict[str, Any]) -> list[types.TextContent]:
     """Execute the download_observations tool."""
@@ -429,6 +437,15 @@ async def download_observations_tool(args: dict[str, Any]) -> list[types.TextCon
                 f"✓ Species '{species_name}': {len(observations)} observations downloaded"
             )
 
+        # This tool duplicates run()'s orchestration, so it has to duplicate both
+        # of run()'s post-processing steps too -- keep the two in step.
+        #
+        # Deduplication: several species names can resolve to one taxon, and
+        # without this the same observation becomes several Wildbook Encounters
+        # carrying the same Encounter.otherCatalogNumbers and the same media.
+        if all_observations_data:
+            all_observations_data = downloader.deduplicate_rows(all_observations_data)
+
         # Generate output
         if all_observations_data:
             from datetime import datetime
@@ -445,8 +462,15 @@ async def download_observations_tool(args: dict[str, Any]) -> list[types.TextCon
                 downloader.write_html(all_observations_data, html_filename)
                 output_files.append(f"HTML review: {output_dir}/{html_filename}")
             else:
+                # Splitting used to happen inside process_observations(); it is
+                # now a separate pass on the direct-CSV path only (the HTML page
+                # does its own splitting in the browser). Without this call the
+                # social_split argument this tool advertises is a silent no-op.
+                csv_rows = all_observations_data
+                if social_split:
+                    csv_rows = split_rows_by_photo(csv_rows)
                 csv_filename = f"inat_observations_{species_part}{place_part}_{timestamp}.csv"
-                downloader.write_csv(all_observations_data, csv_filename)
+                downloader.write_csv(csv_rows, csv_filename)
                 output_files.append(f"CSV export: {output_dir}/{csv_filename}")
 
             output_files.append(f"Photos directory: {downloader.photos_dir}")
@@ -589,8 +613,9 @@ async def list_places_tool(args: dict[str, Any]) -> list[types.TextContent]:
         params = urllib.parse.urlencode({'q': place_query})
         url = f"https://api.inaturalist.org/v1/places/autocomplete?{params}"
 
-        with urllib.request.urlopen(url) as response:
-            data = json.loads(response.read().decode())
+        # Bounded timeout/retry rather than a bare urlopen, which would block
+        # the MCP event loop indefinitely on a stalled iNaturalist response.
+        data = fetch_json(url, rate_limit=0.0)
 
         places = data.get('results', [])
 
@@ -862,7 +887,8 @@ async def download_flickr_tool(args: dict[str, Any]) -> list[types.TextContent]:
             html_review=html_review,
             location_id=location_id,
             submitter_id=submitter_id,
-            project_owner=project_owner
+            project_owner=project_owner,
+            max_results=max_results
         )
 
         # Run the download

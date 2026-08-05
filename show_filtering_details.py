@@ -46,5 +46,6 @@ for video, eval_result in sorted(rejected, key=lambda x: x[1]['score'], reverse=
     print(f"    Reasons: {', '.join(eval_result['reasons'][:2])}")
 
 print(f"\n" + "=" * 80)
-print(f"SUMMARY: {len(accepted)}/{len(videos)} videos passed strict filtering ({len(accepted)*100/len(videos):.1f}%)")
+pct = (len(accepted) * 100 / len(videos)) if videos else 0.0
+print(f"SUMMARY: {len(accepted)}/{len(videos)} videos passed strict filtering ({pct:.1f}%)")
 print(f"=" * 80)

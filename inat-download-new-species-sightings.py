@@ -10,10 +10,13 @@ including observation data (CSV) and photos.
 import argparse
 import csv
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any
+import shutil
+import urllib.error
 import urllib.request
 import urllib.parse
 import json
@@ -21,12 +24,180 @@ import time
 import uuid
 
 
+# Without an explicit timeout urllib blocks forever on a server that accepts the
+# connection and then goes quiet.
+HTTP_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = 120
+MAX_RETRIES = 3
+
+# A cell a spreadsheet would evaluate rather than display. Two details keep this
+# byte-for-byte equivalent to the JavaScript copies rather than merely similar:
+#   re.ASCII -- Python's \d matches every Unicode decimal digit and JavaScript's
+#     matches 0-9, so without it "-٣" is a number here and a formula there.
+#   \Z rather than $ -- Python's $ also matches just before a trailing newline
+#     and JavaScript's (unflagged) $ does not, so "-16.5\n" would be left alone
+#     here and prefixed there.
+_FORMULA_LEAD_CHARS = ('=', '+', '-', '@', '\t', '\r')
+_PLAIN_NUMBER_RE = re.compile(r'^-?\d*\.?\d+\Z', re.ASCII)
+
+
+def neutralize_formula(value: Any) -> Any:
+    r"""
+    Prefix an apostrophe to a value a spreadsheet would treat as a formula.
+
+    iNaturalist free text (place_guess, common names, user logins) reaches the
+    Wildbook CSV verbatim, and a locality beginning "=" or "-" or "@" becomes a
+    live formula the moment someone opens the file in Excel or Sheets.
+
+    Genuine negative numbers -- every southern latitude, every western longitude
+    -- are left alone, so this must test for a leading formula character AND for
+    the value not being a plain number.
+
+    FIVE COPIES OF THIS RULE EXIST and must stay identical, or the same
+    observation exports differently depending on which button the reviewer
+    pressed (measured once: `-Somewhere odd` from the direct CSV against
+    `'-Somewhere odd` from the review page):
+      1. here (:40), for this module's write_csv
+      2. neutralize_formula() in inat-mcp-server/flickr_tools.py:50 -- a separate
+         copy on purpose: the MCP server must not import this hyphenated
+         top-level script, and this script must not depend on the server package
+      3. escapeCSV() in this module's generated review page (:2113)
+      4. the escape() closure in flickr_tools' generated review page (:1196)
+      5. the escape() closure in youtube_tools' generated CSV export (:1394)
+
+    Copies 3-5 are ANONYMOUS closures, so no identifier finds them and grepping
+    for a function name silently under-reports (this census said "four" until a
+    reviewer counted). Audit all five with:
+
+        grep -rn "_FORMULA_LEAD_CHARS = \|\[=+" \
+            inat-download-new-species-sightings.py \
+            inat-mcp-server/flickr_tools.py inat-mcp-server/youtube_tools.py
+
+    Expect SEVEN hits: the five copies plus this same command quoted in the two
+    Python docstrings. The line numbers listed above are indicative and drift;
+    the grep is the authoritative census.
+
+    Args:
+        value: Any CSV cell value
+
+    Returns:
+        The value unchanged, or a string with a leading apostrophe. Non-strings
+        that need no guard come back untouched, so benign output is byte-for-byte
+        what it was before this guard existed.
+    """
+    if value is None:
+        return value
+    text = str(value)
+    if text[:1] in _FORMULA_LEAD_CHARS and not _PLAIN_NUMBER_RE.match(text):
+        return "'" + text
+    return value
+
+
+def fetch_json(url: str, rate_limit: float = 1.0, timeout: int = HTTP_TIMEOUT,
+               max_retries: int = MAX_RETRIES) -> Dict[str, Any]:
+    """
+    GET a JSON document, retrying transient failures with exponential backoff.
+
+    Args:
+        url: Fully-formed request URL
+        rate_limit: Seconds to pause after a successful request
+        timeout: Per-request socket timeout in seconds
+        max_retries: Total attempts before giving up
+
+    Returns:
+        The decoded JSON body
+
+    Raises:
+        RuntimeError: If every attempt failed
+    """
+    last_error = None
+    attempts = 0
+
+    for attempt in range(1, max_retries + 1):
+        attempts = attempt
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                payload = json.loads(response.read().decode())
+            time.sleep(rate_limit)
+            return payload
+        except urllib.error.HTTPError as e:
+            last_error = e
+            # 4xx other than rate-limiting will not improve on retry.
+            if e.code != 429 and e.code < 500:
+                break
+        except Exception as e:
+            last_error = e
+
+        if attempt < max_retries:
+            backoff = rate_limit * (2 ** attempt)
+            print(f"    Request failed ({last_error}); retrying in {backoff:.1f}s "
+                  f"(attempt {attempt + 1}/{max_retries})")
+            time.sleep(backoff)
+
+    plural = '' if attempts == 1 else 's'
+    raise RuntimeError(
+        f"Request failed after {attempts} attempt{plural}: {url} ({last_error})"
+    )
+
+
+def split_rows_by_photo(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Expand each split-eligible row into one row per photo.
+
+    Rows sharing an observation become one Wildbook Sighting: they all carry the
+    observation's pre-generated _sighting_id in Sighting.sightingID.
+
+    This is only ever called when social_split is on, so *every* row it returns
+    gets a promoted sighting ID -- not just the ones that actually split. A lone
+    encounter (single photo, or organism-evidence so splitting is suppressed)
+    previously produced a one-encounter Sighting in Wildbook, and it must keep
+    doing so rather than silently losing its Sighting.sightingID just because it
+    had nothing to split.
+
+    This runs *after* deduplication, which is deliberate. When splitting happened
+    inside process_observations(), deduplicate_rows() saw the split rows and
+    collapsed them back to one -- silently turning --social-split-observations
+    into a no-op. Keeping the split downstream makes that impossible.
+
+    Args:
+        rows: Processed observation rows, one per observation
+
+    Returns:
+        A new list of new row dicts; neither the input rows nor their contents
+        (e.g. _photo_list) are modified.
+    """
+    expanded = []
+
+    for row in rows:
+        photo_list = row.get('_photo_list', [])
+        license_list = row.get('_license_list', [])
+
+        if not row.get('_split_eligible') or len(photo_list) <= 1:
+            passthrough_row = dict(row)
+            passthrough_row['Sighting.sightingID'] = row['_sighting_id']
+            expanded.append(passthrough_row)
+            continue
+
+        for photo_index, photo_filename in enumerate(photo_list):
+            split_row = dict(row)
+            split_row['Sighting.sightingID'] = row['_sighting_id']
+            split_row['photo_count'] = 1
+            split_row['photo_filenames'] = photo_filename
+            split_row['_photo_list'] = [photo_filename]
+            split_row['_license_list'] = (
+                [license_list[photo_index]] if photo_index < len(license_list) else []
+            )
+            expanded.append(split_row)
+
+    return expanded
+
+
 class iNaturalistDownloader:
     """Downloads observations and photos from iNaturalist API."""
 
     BASE_URL = "https://api.inaturalist.org/v1"
 
-    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None, social_split: bool = False, clip_filter: str = None, project_owner: str = None):
+    def __init__(self, output_dir: str, days_back: int, species_list: List[str], rate_limit: float = 1.0, html_review: bool = False, place: str = None, location_id: str = None, submitter_id: str = None, social_split: bool = False, project_owner: str = None, start_date: str = None, end_date: str = None):
         """
         Initialize the downloader.
 
@@ -40,8 +211,9 @@ class iNaturalistDownloader:
             location_id: Optional location ID to add to all observations in Encounter.locationID column
             submitter_id: Optional submitter ID to add to all observations in Encounter.submitterID column
             social_split: Split multi-photo observations into separate rows with shared sighting ID (default: False)
-            clip_filter: Optional CLIP text prompts to filter out images (comma-separated, e.g., "footprint,track,paw print")
             project_owner: Optional Wildbook username to own the project (required for new projects)
+            start_date: Optional explicit window start, YYYY-MM-DD (overrides days_back)
+            end_date: Optional explicit window end, YYYY-MM-DD (defaults to today)
         """
         self.output_dir = Path(output_dir)
         self.days_back = days_back
@@ -53,22 +225,70 @@ class iNaturalistDownloader:
         self.location_id = location_id
         self.submitter_id = submitter_id
         self.social_split = social_split
-        self.clip_filter = clip_filter
         self.project_owner = project_owner
+        # Validate here rather than at first use: a malformed date otherwise
+        # surfaces as an empty result set after a long download.
+        self.start_date = self._parse_date(start_date, '--start-date')
+        self.end_date = self._parse_date(end_date, '--end-date')
+        if self.start_date and self.end_date and self.start_date > self.end_date:
+            raise ValueError(
+                f"--start-date ({start_date}) is after --end-date ({end_date}); "
+                f"iNaturalist would return nothing for that window"
+            )
         self.photos_dir = self.output_dir / "photos"
-
-        # CLIP model (lazy-loaded when needed)
-        self.clip_model = None
-        self.clip_processor = None
 
         # Create directories if they don't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.photos_dir.mkdir(parents=True, exist_ok=True)
 
+    def _get_json(self, url: str) -> Dict[str, Any]:
+        """GET a JSON document using this downloader's rate limit."""
+        return fetch_json(url, rate_limit=self.rate_limit)
+
+    @staticmethod
+    def _parse_date(value: str, flag: str) -> datetime:
+        """
+        Parse a YYYY-MM-DD command-line date, or None when not supplied.
+
+        Args:
+            value: The raw string, or None
+            flag: The flag name, for the error message
+
+        Returns:
+            A datetime, or None
+
+        Raises:
+            ValueError: If the value is not a valid YYYY-MM-DD date
+        """
+        if value is None:
+            return None
+        try:
+            return datetime.strptime(value, "%Y-%m-%d")
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{flag} must be a date in YYYY-MM-DD form, got {value!r}"
+            )
+
     def get_date_range(self) -> tuple:
-        """Calculate the date range for the search."""
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=self.days_back)
+        """
+        Calculate the date range for the search.
+
+        Explicit --start-date / --end-date win over --days, which can only ever
+        express a window ending today and so cannot describe a closed historical
+        range. The values map straight onto iNaturalist's d1/d2, which are
+        inclusive whole dates -- so a request for 00:00 on the start day through
+        23:59 on the end day is exactly this window.
+
+        Returns:
+            (start, end) as YYYY-MM-DD strings
+        """
+        end_date = self.end_date or datetime.now()
+        if self.start_date:
+            start_date = self.start_date
+        else:
+            # An --end-date without a --start-date still spans days_back before
+            # it, rather than silently widening to every observation ever.
+            start_date = end_date - timedelta(days=self.days_back)
         return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
 
     def generate_project_name(self, genus: str, specific_epithet: str) -> str:
@@ -109,11 +329,7 @@ class iNaturalistDownloader:
         url = f"{self.BASE_URL}/taxa?{params}"
 
         try:
-            with urllib.request.urlopen(url) as response:
-                data = json.loads(response.read().decode())
-
-            # Rate limiting
-            time.sleep(self.rate_limit)
+            data = self._get_json(url)
 
             if data['results']:
                 taxon = data['results'][0]
@@ -145,11 +361,7 @@ class iNaturalistDownloader:
         url = f"{self.BASE_URL}/places/autocomplete?{params}"
 
         try:
-            with urllib.request.urlopen(url) as response:
-                data = json.loads(response.read().decode())
-
-            # Rate limiting
-            time.sleep(self.rate_limit)
+            data = self._get_json(url)
 
             places = data.get('results', [])
 
@@ -226,120 +438,36 @@ class iNaturalistDownloader:
 
             url = f"{self.BASE_URL}/observations?{params}"
 
-            try:
-                with urllib.request.urlopen(url) as response:
-                    data = json.loads(response.read().decode())
+            data = self._get_json(url)
 
-                # Rate limiting
-                time.sleep(self.rate_limit)
+            results = data.get('results', [])
 
-                results = data.get('results', [])
-
-                if not results:
-                    break
-
-                all_observations.extend(results)
-                print(f"    Page {page}: {len(results)} observations")
-
-                # Check if there are more pages
-                total_results = data.get('total_results', 0)
-                if len(all_observations) >= total_results:
-                    break
-
-                page += 1
-
-            except Exception as e:
-                print(f"    Error fetching observations (page {page}): {e}")
+            if not results:
                 break
+
+            all_observations.extend(results)
+            print(f"    Page {page}: {len(results)} observations")
+
+            # Check if there are more pages
+            total_results = data.get('total_results', 0)
+            if len(all_observations) >= total_results:
+                break
+
+            page += 1
 
         print(f"  Total observations found: {len(all_observations)}")
         return all_observations
 
-    def load_clip_model(self):
-        """Load CLIP model for image analysis (lazy loading)."""
-        if self.clip_model is not None:
-            return  # Already loaded
-
-        try:
-            from PIL import Image
-            import torch
-            from transformers import CLIPProcessor, CLIPModel
-
-            print("Loading CLIP model for image analysis...")
-            self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-            self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-            print("  CLIP model loaded successfully")
-        except ImportError:
-            print("\nError: CLIP filtering requires additional packages.")
-            print("Please install them with: pip install transformers torch pillow")
-            sys.exit(1)
-        except Exception as e:
-            print(f"\nError loading CLIP model: {e}")
-            sys.exit(1)
-
-    def analyze_image_with_clip(self, image_path: str, filter_terms: List[str]) -> bool:
-        """
-        Analyze an image using CLIP to determine if it matches any filter terms.
-
-        Args:
-            image_path: Path to the image file
-            filter_terms: List of text descriptions to check against (e.g., ["footprint", "track"])
-
-        Returns:
-            True if image matches any filter term (should be filtered out), False otherwise
-        """
-        if not self.clip_model:
-            self.load_clip_model()
-
-        try:
-            from PIL import Image
-            import torch
-
-            # Load and process image
-            image = Image.open(image_path).convert('RGB')
-
-            # Create text prompts - add positive prompt for the actual organism
-            negative_prompts = filter_terms  # e.g., ["footprint", "track", "paw print"]
-            positive_prompt = ["a photograph of a live animal", "a photograph of a living organism"]
-            all_prompts = positive_prompt + negative_prompts
-
-            # Process inputs
-            inputs = self.clip_processor(
-                text=all_prompts,
-                images=image,
-                return_tensors="pt",
-                padding=True
-            )
-
-            # Get predictions
-            with torch.no_grad():
-                outputs = self.clip_model(**inputs)
-                logits_per_image = outputs.logits_per_image
-                probs = logits_per_image.softmax(dim=1)[0]
-
-            # Check if any negative prompt has high probability
-            # We use indices 2+ for negative prompts (first 2 are positive)
-            negative_probs = probs[len(positive_prompt):]
-            max_negative_prob = negative_probs.max().item()
-
-            # If any filter term has >40% probability, mark for filtering
-            # Adjust threshold as needed (higher = more strict)
-            threshold = 0.40
-
-            if max_negative_prob > threshold:
-                max_idx = negative_probs.argmax().item()
-                matched_term = filter_terms[max_idx]
-                return True, matched_term, max_negative_prob
-
-            return False, None, 0.0
-
-        except Exception as e:
-            print(f"      Warning: Error analyzing image {image_path} with CLIP: {e}")
-            return False, None, 0.0
-
     def download_photo(self, url: str, filename: str) -> bool:
         """
         Download a photo from URL to the photos directory.
+
+        Retries transient failures the same way fetch_json does. A photo lost to
+        a one-off network blip is not cosmetic: the row's photo list comes out
+        short, and a second pass over the same observation (two species names
+        resolving to one taxon) then disagrees with the first about which media
+        the observation has. deduplicate_rows survives that by construction, but
+        the cheapest fix is not to drop the photo in the first place.
 
         Args:
             url: URL of the photo
@@ -354,12 +482,36 @@ class iNaturalistDownloader:
         if filepath.exists():
             return True
 
-        try:
-            urllib.request.urlretrieve(url, filepath)
-            return True
-        except Exception as e:
-            print(f"      Error downloading photo {filename}: {e}")
-            return False
+        # Download to a sibling .part file and rename on success, so an
+        # interrupted transfer is not cached as a complete photo.
+        partial = filepath.with_name(filepath.name + '.part')
+        last_error = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response, \
+                        open(partial, 'wb') as out:
+                    shutil.copyfileobj(response, out)
+                partial.replace(filepath)
+                return True
+            except urllib.error.HTTPError as e:
+                last_error = e
+                partial.unlink(missing_ok=True)
+                # 4xx other than rate-limiting will not improve on retry.
+                if e.code != 429 and e.code < 500:
+                    break
+            except Exception as e:
+                last_error = e
+                partial.unlink(missing_ok=True)
+
+            if attempt < MAX_RETRIES:
+                backoff = self.rate_limit * (2 ** attempt)
+                print(f"      Photo download failed ({last_error}); retrying in "
+                      f"{backoff:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(backoff)
+
+        print(f"      Error downloading photo {filename}: {last_error}")
+        return False
 
     def extract_gif_frames(self, gif_path: Path) -> List[str]:
         """
@@ -521,7 +673,12 @@ class iNaturalistDownloader:
 
             # Parse annotations for living status and evidence of presence
             living_status = 'alive'  # Default to 'alive'
-            is_single_subject = False  # Track if observation has "single subject" annotation
+            # iNaturalist "Evidence of Presence" == "Organism". NOTE: this says
+            # the evidence is the animal itself, NOT that only one individual is
+            # pictured; iNaturalist has no single-subject annotation. Splitting
+            # is currently suppressed for these, which is almost certainly too
+            # broad -- see README for the open question.
+            has_organism_evidence = False
             has_non_organism_evidence = False  # Track if evidence is something other than organism
             annotations = obs.get('annotations')
             if annotations and isinstance(annotations, list):
@@ -538,9 +695,9 @@ class iNaturalistDownloader:
 
                         # Evidence of Presence annotations (controlled_attribute_id == 22)
                         if controlled_attribute_id == 22:
-                            # controlled_value_id 24 = "Organism" (single subject - good)
+                            # controlled_value_id 24 = "Organism"
                             if controlled_value_id == 24:
-                                is_single_subject = True
+                                has_organism_evidence = True
                             # Any other value (track, scat, molt, etc.) should be deselected
                             elif controlled_value_id is not None:
                                 has_non_organism_evidence = True
@@ -553,6 +710,9 @@ class iNaturalistDownloader:
             photos = obs.get('photos', [])
             photo_filenames = []
             photo_licenses = []
+            # True once one iNaturalist photo has become several files, which
+            # only happens for an animated GIF. See _split_eligible below.
+            gif_frames_extracted = False
 
             if photos:
                 print(f"  Processing observation {idx}/{len(observations)} (ID: {obs_id}, {len(photos)} photos)...")
@@ -578,6 +738,7 @@ class iNaturalistDownloader:
                             extracted_frames = self.extract_gif_frames(photo_path)
                             if extracted_frames:
                                 # Add all extracted frames to the list (GIF was deleted)
+                                gif_frames_extracted = True
                                 for frame_filename in extracted_frames:
                                     photo_filenames.append(frame_filename)
                                     photo_licenses.append(license_code)
@@ -606,93 +767,107 @@ class iNaturalistDownloader:
             # Generate project name based on species taxonomy
             project_name = self.generate_project_name(encounter_genus, encounter_specific_epithet)
 
-            # If social_split is enabled and there are multiple photos, create one row per photo
-            # BUT only if the observation is NOT marked as single subject
-            if self.social_split and len(photo_filenames) > 1 and not is_single_subject:
-                # Generate a common sighting ID for all photos from this observation
-                sighting_id = str(uuid.uuid4())
+            # Every observation gets a sighting ID, but it stays internal until a
+            # split actually needs it -- either split_rows_by_photo() on the CSV
+            # path, or the reviewer's Split button on the HTML path. Promoting it
+            # unconditionally would populate a column that is empty today.
+            sighting_id = None
+            # An animated GIF is ONE iNaturalist photo that extract_gif_frames
+            # turned into N JPEG files. Splitting counts files, so a 30-frame GIF
+            # would become 30 Encounters of the same animal in the same second --
+            # 29 guaranteed self-matches for Wildbook's ID pipeline. Splitting is
+            # therefore refused for the whole observation: the spec (decision 1,
+            # and the export table) fixes a split row at exactly one media asset,
+            # so a frame group cannot be one row, and the fallback -- one
+            # Encounter carrying every frame, exactly as today's default mode
+            # exports it -- is the conservative answer.
+            split_eligible = (
+                self.social_split
+                and len(photo_filenames) > 1
+                and not has_organism_evidence
+                and not gif_frames_extracted
+            )
 
-                # Create one row for each photo
-                for photo_idx, (photo_filename, photo_license) in enumerate(zip(photo_filenames, photo_licenses)):
-                    row = {
-                        'observation_id': obs_id,
-                        'observed_on': observed_on,
-                        'Encounter.year': encounter_year,
-                        'Encounter.month': encounter_month,
-                        'Encounter.day': encounter_day,
-                        'scientific_name': scientific_name,
-                        'Encounter.genus': encounter_genus,
-                        'Encounter.specificEpithet': encounter_specific_epithet,
-                        'common_name': common_name,
-                        'Encounter.decimalLatitude': latitude,
-                        'Encounter.decimalLongitude': longitude,
-                        'Encounter.verbatimLocality': place_guess,
-                        'Encounter.locationID': self.location_id if self.location_id else None,
-                        'Encounter.livingStatus': living_status,
-                        'Encounter.submitterID': self.submitter_id if self.submitter_id else 'public',
-                        'Encounter.state': 'unapproved',
-                        'Encounter.project0.researchProjectName': project_name,
-                        'Encounter.project0.ownerUsername': self.project_owner if self.project_owner else None,
-                        'observer': observer,
-                        'quality_grade': quality_grade,
-                        'url': obs_url,
-                        'Encounter.researcherComments': researcher_comments,
-                        'Sighting.sightingID': sighting_id,
-                        'photo_count': 1,  # Each row has one photo
-                        'photo_filenames': photo_filename,
-                        '_photo_list': [photo_filename],  # Single photo for this encounter
-                        '_license_list': [photo_license],  # Single license for this encounter
-                        '_has_non_organism_evidence': has_non_organism_evidence,  # For HTML deselection
-                        '_is_skulls_and_bones': is_skulls_and_bones,  # For HTML deselection
-                        '_coordinates_obscured': obscured,  # For HTML display
-                        '_geoprivacy': geoprivacy,  # User-set geoprivacy
-                        '_taxon_geoprivacy': taxon_geoprivacy,  # Auto geoprivacy from conservation status
-                        '_public_positional_accuracy': public_positional_accuracy  # Accuracy in meters
-                    }
-                    processed_data.append(row)
-            else:
-                # Original behavior: one row per observation
-                # Sighting ID only populated when social_split is enabled
-                sighting_id = str(uuid.uuid4()) if self.social_split and len(photo_filenames) >= 1 else None
-
-                row = {
-                    'observation_id': obs_id,
-                    'observed_on': observed_on,
-                    'Encounter.year': encounter_year,
-                    'Encounter.month': encounter_month,
-                    'Encounter.day': encounter_day,
-                    'scientific_name': scientific_name,
-                    'Encounter.genus': encounter_genus,
-                    'Encounter.specificEpithet': encounter_specific_epithet,
-                    'common_name': common_name,
-                    'Encounter.decimalLatitude': latitude,
-                    'Encounter.decimalLongitude': longitude,
-                    'Encounter.verbatimLocality': place_guess,
-                    'Encounter.locationID': self.location_id if self.location_id else None,
-                    'Encounter.livingStatus': living_status,
-                    'Encounter.submitterID': self.submitter_id if self.submitter_id else 'public',
-                    'Encounter.state': 'unapproved',
-                    'Encounter.project0.researchProjectName': project_name,
-                    'Encounter.project0.ownerUsername': self.project_owner if self.project_owner else None,
-                    'observer': observer,
-                    'quality_grade': quality_grade,
-                    'url': obs_url,
-                    'Encounter.researcherComments': researcher_comments,
-                    'Sighting.sightingID': sighting_id,
-                    'photo_count': len(photo_filenames),
-                    'photo_filenames': '; '.join(photo_filenames),
-                    '_photo_list': photo_filenames,  # Temporary field for photo processing
-                    '_license_list': photo_licenses,  # Temporary field for license processing
-                    '_has_non_organism_evidence': has_non_organism_evidence,  # For HTML deselection
-                    '_is_skulls_and_bones': is_skulls_and_bones,  # For HTML deselection
-                    '_coordinates_obscured': obscured,  # For HTML display
-                    '_geoprivacy': geoprivacy,  # User-set geoprivacy
-                    '_taxon_geoprivacy': taxon_geoprivacy,  # Auto geoprivacy from conservation status
-                    '_public_positional_accuracy': public_positional_accuracy  # Accuracy in meters
-                }
-                processed_data.append(row)
+            row = {
+                'observation_id': obs_id,
+                'observed_on': observed_on,
+                'Encounter.year': encounter_year,
+                'Encounter.month': encounter_month,
+                'Encounter.day': encounter_day,
+                'scientific_name': scientific_name,
+                'Encounter.genus': encounter_genus,
+                'Encounter.specificEpithet': encounter_specific_epithet,
+                'common_name': common_name,
+                'Encounter.decimalLatitude': latitude,
+                'Encounter.decimalLongitude': longitude,
+                'Encounter.verbatimLocality': place_guess,
+                'Encounter.locationID': self.location_id if self.location_id else None,
+                'Encounter.livingStatus': living_status,
+                'Encounter.submitterID': self.submitter_id if self.submitter_id else 'public',
+                'Encounter.state': 'unapproved',
+                'Encounter.project0.researchProjectName': project_name,
+                'Encounter.project0.ownerUsername': self.project_owner if self.project_owner else None,
+                'observer': observer,
+                'quality_grade': quality_grade,
+                'url': obs_url,
+                'Encounter.otherCatalogNumbers': f'iNaturalist:{obs_id}',
+                'Encounter.researcherComments': researcher_comments,
+                'Sighting.sightingID': sighting_id,
+                'photo_count': len(photo_filenames),
+                'photo_filenames': '; '.join(photo_filenames),
+                '_photo_list': photo_filenames,  # Temporary field for photo processing
+                '_license_list': photo_licenses,  # Temporary field for license processing
+                '_has_non_organism_evidence': has_non_organism_evidence,  # For HTML deselection
+                '_is_skulls_and_bones': is_skulls_and_bones,  # For HTML deselection
+                '_coordinates_obscured': obscured,  # For HTML display
+                '_geoprivacy': geoprivacy,  # User-set geoprivacy
+                '_taxon_geoprivacy': taxon_geoprivacy,  # Auto geoprivacy from conservation status
+                '_public_positional_accuracy': public_positional_accuracy,  # Accuracy in meters
+                '_sighting_id': str(uuid.uuid4()),  # Promoted to the column only when split
+                '_split_eligible': split_eligible,  # Whether the flag would split this one
+                '_gif_frames_extracted': gif_frames_extracted,  # Files outnumber source photos
+            }
+            processed_data.append(row)
 
         return processed_data
+
+    def deduplicate_rows(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Keep exactly one row per observation.
+
+        Several species names can resolve to one taxon, so the same observation
+        can be processed more than once. The key is observation_id ALONE, and it
+        has to stay that way: splitting now runs strictly after deduplication
+        (see split_rows_by_photo and run()), so every row reaching here describes
+        a whole observation and two rows sharing an ID are always duplicates.
+
+        A composite (observation_id, photos) key used to be needed when
+        process_observations did the splitting itself. It is now strictly weaker
+        than the ID alone: the two passes over one observation need not agree on
+        the photo list -- a transient download failure in the first pass is
+        enough -- and both rows would then survive, giving Wildbook two
+        Encounters carrying the same Encounter.otherCatalogNumbers and the same
+        media. Identical media in two Encounters self-match, fabricating a
+        resight of one animal at one instant.
+
+        On collision the row with the most photos wins, so a pass that lost a
+        photo to a failed download cannot displace a complete one.
+
+        Args:
+            data: Processed observation rows, one per observation
+
+        Returns:
+            The rows in their original order, with duplicates removed
+        """
+        unique_rows = {}
+        for row in data:
+            key = row.get('observation_id')
+            previous = unique_rows.get(key)
+            if previous is None or (
+                len(row.get('_photo_list', [])) > len(previous.get('_photo_list', []))
+            ):
+                unique_rows[key] = row
+        return list(unique_rows.values())
 
     def write_csv(self, data: List[Dict[str, Any]], filename: str):
         """
@@ -715,20 +890,26 @@ class iNaturalistDownloader:
             if len(photo_list) > max_photos:
                 max_photos = len(photo_list)
 
-        # Add individual photo columns and license columns to each row
+        # Build the export rows as copies. Callers may export the same data
+        # more than once (CSV then HTML), so the input rows keep their
+        # underscore-prefixed internal fields.
+        export_rows = []
         for row in data:
             photo_list = row.get('_photo_list', [])
             license_list = row.get('_license_list', [])
+            export_row = {k: v for k, v in row.items() if not k.startswith('_')}
             for i in range(max_photos):
-                # Add photo filename column
-                photo_column_name = f'Encounter.mediaAsset{i}'
-                row[photo_column_name] = photo_list[i] if i < len(photo_list) else None
-                # Add license column
-                license_column_name = f'Encounter.mediaAsset{i}.license'
-                row[license_column_name] = license_list[i] if i < len(license_list) else None
-            # Remove temporary fields
-            del row['_photo_list']
-            del row['_license_list']
+                export_row[f'Encounter.mediaAsset{i}'] = (
+                    photo_list[i] if i < len(photo_list) else None
+                )
+                export_row[f'Encounter.mediaAsset{i}.license'] = (
+                    license_list[i] if i < len(license_list) else None
+                )
+            # Applied to every cell, exactly as the review page's escapeCSV()
+            # does, so the two export paths cannot disagree about any field.
+            export_rows.append(
+                {k: neutralize_formula(v) for k, v in export_row.items()}
+            )
 
         # Build fieldnames with dynamic photo columns
         fieldnames = [
@@ -754,11 +935,10 @@ class iNaturalistDownloader:
             'observer',
             'quality_grade',
             'url',
+            'Encounter.otherCatalogNumbers',
             'Encounter.researcherComments',
             'photo_count',
-            'photo_filenames',
-            '_has_non_organism_evidence',
-            '_is_skulls_and_bones'
+            'photo_filenames'
         ]
 
         # Add photo asset columns and license columns
@@ -769,7 +949,7 @@ class iNaturalistDownloader:
         with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(data)
+            writer.writerows(export_rows)
 
         print(f"\nCSV file written: {csv_path}")
         print(f"Total observations: {len(data)}")
@@ -811,16 +991,66 @@ class iNaturalistDownloader:
                     # Create relative path from HTML file to photo
                     photo_path = f"photos/{photo_list[0]}"
 
-            # Build array of all photo paths for gallery
-            all_photo_paths = []
-            for photo_filename in photo_list:
-                photo_file_path = self.photos_dir / photo_filename
-                if photo_file_path.exists():
-                    all_photo_paths.append(f"photos/{photo_filename}")
+            # Displayable path per photo, or None when the download failed.
+            #
+            # INVARIANT: len(all_photo_paths) == len(photo_list). A missing file
+            # MUST become None rather than be dropped: a split row previews
+            # all_photo_paths[i] and exports photos[i], so compacting this list
+            # would shift every later row's preview and show the reviewer a
+            # different photo from the one they are deciding about. The gallery
+            # skips the Nones instead (see galleryFor() in the page).
+            #
+            # Note this list is sized to photo_list, NOT padded to max_photos the
+            # way photos / licenses / photo_licensed are, and that asymmetry is
+            # deliberate rather than an oversight. Those three are padded to a
+            # common length because they are index-paired with each other and
+            # read by index (photos[i] / licenses[i] / photo_licensed[i] must
+            # describe the same photo i); a short array would silently misalign
+            # which photo is considered licensed. Nothing walks all_photo_paths
+            # that way: it is only ever indexed by a photoIndex already known to
+            # be < photo_count, so padding it would add slots no code path can
+            # reach. Index alignment with photo_list is the invariant that
+            # matters; equal length with photos is not.
+            all_photo_paths = [
+                f"photos/{photo_filename}"
+                if (self.photos_dir / photo_filename).exists() else None
+                for photo_filename in photo_list
+            ]
+            assert len(all_photo_paths) == len(photo_list)
 
             # Get unique licenses for display
             unique_licenses = list(set([lic for lic in license_list if lic]))
             license_display = ', '.join(unique_licenses) if unique_licenses else 'No license'
+
+            # Only default-select a row when *every* photo it would export
+            # carries a license. One licensed photo used to be enough, which
+            # quietly shipped all-rights-reserved media alongside it.
+            all_media_licensed = bool(photo_list) and all(
+                license_list[i] if i < len(license_list) else None
+                for i in range(len(photo_list))
+            )
+
+            # Per-photo licence flags. A split row only exports its own photo, so
+            # it can be selected on that photo's licence alone -- which lets
+            # splitting rescue the licensed photos from an observation that is
+            # deselected wholesale under the all-or-nothing rule.
+            photo_licensed = [
+                bool(license_list[i]) if i < len(license_list) else False
+                for i in range(len(photo_list))
+            ]
+            photo_licensed += [False] * (max_photos - len(photo_licensed))
+
+            # Whether the reviewer may split this observation at all. Kept in
+            # Python with the rest of the media/biology rules -- the browser only
+            # holds state. More than one file is not sufficient: an animated GIF
+            # is one photo whose frames were extracted to N files, and splitting
+            # those would emit N Encounters of one animal in one instant (see
+            # _split_eligible in process_observations).
+            #
+            # can_split False must imply initially_split False, or isSplit()
+            # would start a row split that no button can undo, so derive one from
+            # the other rather than restating the condition.
+            can_split = len(photo_list) > 1 and not row.get('_gif_frames_extracted', False)
 
             # Build observation object
             obs_data = {
@@ -841,14 +1071,19 @@ class iNaturalistDownloader:
                 'submitter_id': row.get('Encounter.submitterID'),
                 'project_name': row.get('Encounter.project0.researchProjectName'),
                 'project_owner': row.get('Encounter.project0.ownerUsername'),
-                'sighting_id': row.get('Sighting.sightingID'),
+                'sighting_id': row.get('_sighting_id'),
+                'can_split': can_split,
+                'initially_split': bool(row.get('_split_eligible')) and can_split,
+                'photo_licensed': photo_licensed,
                 'observer': row.get('observer'),
                 'quality_grade': row.get('quality_grade'),
                 'url': row.get('url'),
+                'other_catalog_numbers': row.get('Encounter.otherCatalogNumbers'),
                 'researcher_comments': row.get('Encounter.researcherComments'),
                 'photo_count': len(photo_list),
                 'photo_filenames': '; '.join(photo_list),
                 'license_display': license_display,
+                'all_media_licensed': all_media_licensed,
                 'has_non_organism_evidence': row.get('_has_non_organism_evidence', False),
                 'is_skulls_and_bones': row.get('_is_skulls_and_bones', False),
                 'coordinates_obscured': row.get('_coordinates_obscured', False),
@@ -880,14 +1115,37 @@ class iNaturalistDownloader:
         print(f"Open this file in your web browser to review and select observations.")
         print(f"Maximum photos per observation: {max_photos}")
 
+    @staticmethod
+    def _json_for_script_block(payload: Any) -> str:
+        """
+        Serialize to JSON that is safe to inline inside a <script> element.
+
+        iNaturalist free text (place_guess, common names, user logins) reaches
+        this page verbatim. An unescaped "</script>" would close the block
+        early, breaking the page and executing whatever followed.
+        """
+        # ensure_ascii=True also escapes U+2028/U+2029, which are legal in
+        # JSON but are line terminators to a JavaScript parser.
+        return (
+            json.dumps(payload, indent=2, ensure_ascii=True)
+            .replace('<', '\\u003c')
+            .replace('>', '\\u003e')
+            .replace('&', '\\u0026')
+        )
+
     def _generate_html_template(self, observations: List[Dict], max_photos: int, social_split: bool) -> str:
         """Generate the HTML template with embedded JavaScript."""
-        observations_json_str = json.dumps(observations, indent=2)
+        observations_json_str = self._json_for_script_block(observations)
 
-        # Build filename components for CSV download
+        # Build the CSV download filename. Species names come from the command
+        # line and can contain apostrophes ("Cooper's hawk"), which would break
+        # out of a raw JS string literal, so emit it as JSON.
         species_part = "_".join([s.replace(" ", "-") for s in self.species_list[:2]])
         place_part = f"_{self.place.replace(' ', '-')}" if self.place else ""
         date_part = datetime.now().strftime("%Y%m%d")
+        csv_filename_js = self._json_for_script_block(
+            f"inat_observations_export_{species_part}{place_part}_{date_part}.csv"
+        )
         social_split_js = 'true' if social_split else 'false'
 
         return f'''<!DOCTYPE html>
@@ -1029,7 +1287,7 @@ class iNaturalistDownloader:
             background: #d0d0d0;
         }}
 
-        .btn-merge {{
+        .btn-split {{
             padding: 4px 12px;
             font-size: 11px;
             background: #2c7a3f;
@@ -1040,15 +1298,15 @@ class iNaturalistDownloader:
             transition: all 0.2s;
         }}
 
-        .btn-merge:hover {{
+        .btn-split:hover {{
             background: #235c31;
         }}
 
-        .btn-merge.merged {{
+        .btn-split.split {{
             background: #dc3545;
         }}
 
-        .btn-merge.merged:hover {{
+        .btn-split.split:hover {{
             background: #c82333;
         }}
 
@@ -1098,12 +1356,6 @@ class iNaturalistDownloader:
         .obs-group-even:hover,
         .obs-group-odd:hover {{
             background: #fff9e6 !important;  /* Light yellow on hover */
-        }}
-
-        /* Merged state styling */
-        .merged-row {{
-            border-left: 4px solid;  /* Border color set dynamically via JavaScript */
-            background: #fff0e6 !important;  /* Light orange background */
         }}
 
         .obs-checkbox {{
@@ -1208,6 +1460,14 @@ class iNaturalistDownloader:
 
         .copy-success.show {{
             display: block;
+        }}
+
+        /* Failure messages (clipboard missing/blocked) reuse #copy-success --
+           without this modifier they would render in the success palette above,
+           telling the reviewer their copy worked when it did not. */
+        .copy-success.copy-error {{
+            background: #f8d7da;
+            color: #721c24;
         }}
 
         .modal {{
@@ -1364,7 +1624,7 @@ class iNaturalistDownloader:
                             <th>Quality</th>
                             <th>License</th>
                             <th>Photos</th>
-                            <th id="merge-header" style="display: none;">Merge</th>
+                            <th id="split-header" style="display: none;">Split</th>
                         </tr>
                     </thead>
                     <tbody id="observations-body">
@@ -1401,292 +1661,334 @@ class iNaturalistDownloader:
     <script>
         // Observation data
         const observations = {observations_json_str};
+        // The width every observation's photos / licenses / photo_licensed array
+        // is padded to. No logic branches on it any more -- the Split column is
+        // gated on can_split -- but it names the padding width those arrays
+        // share, and it is the value tests use to prove the padding happened.
         const maxPhotos = {max_photos};
         const socialSplitMode = {social_split_js};
 
         // Filename components for CSV export
-        const csvFilename = 'inat_observations_export_{species_part}{place_part}_{date_part}.csv';
+        const csvFilename = {csv_filename_js};
 
-        // Track which sighting_ids have been merged (sighting_id -> boolean)
-        const mergedSightings = new Map();
+        // observation_id -> bool. Seeded from initially_split (the flag plus the
+        // organism-evidence suppression), then owned by the reviewer.
+        const splitState = new Map();
 
-        // Track border colors for merged sighting groups (sighting_id -> color)
-        const mergedBorderColors = new Map();
-
-        // Palette of distinct colors for merged groups
-        const mergeColors = [
-            '#ff6b35',  // Orange
-            '#d62828',  // Red
-            '#9b59b6',  // Purple
-            '#3498db',  // Blue
-            '#2ecc71',  // Green
-            '#e67e22',  // Dark orange
-            '#e91e63',  // Pink
-            '#00bcd4',  // Cyan
-            '#ff9800',  // Amber
-            '#795548',  // Brown
-            '#607d8b',  // Blue grey
-            '#f39c12'   // Yellow-orange
-        ];
-
-        // Count how many rows share each sighting_id
-        const sightingIdCounts = new Map();
-        observations.forEach(obs => {{
-            if (obs.sighting_id) {{
-                const count = sightingIdCounts.get(obs.sighting_id) || 0;
-                sightingIdCounts.set(obs.sighting_id, count + 1);
+        function isSplit(obs) {{
+            if (!splitState.has(obs.observation_id)) {{
+                splitState.set(obs.observation_id, Boolean(obs.initially_split));
             }}
-        }});
+            return splitState.get(obs.observation_id);
+        }}
+
+        // Whether the Split column exists on this page at all. Gates the <th>
+        // reveal AND the per-row <td> together -- they must never disagree, or
+        // the body carries a cell the head does not show. Driven by can_split,
+        // not by maxPhotos: a page whose only multi-file observation is an
+        // animated GIF has nothing splittable and so needs no column.
+        const splitColumnShown = observations.some(o => o.can_split);
+
+        function toggleSplit(observationId) {{
+            const obs = observations.find(o => o.observation_id === observationId);
+            // can_split, not photo_count: Python already decided (an animated
+            // GIF's frames are one photo, and must not become N Encounters).
+            if (!obs || !obs.can_split) return;
+            splitState.set(observationId, !isSplit(obs));
+            renderObservations();
+            updateStats();
+            updateCSV();
+        }}
+
+        // One display row per photo when split, otherwise one per observation.
+        function displayRows() {{
+            const rows = [];
+            observations.forEach(obs => {{
+                if (isSplit(obs)) {{
+                    // Iterate photo_count, not photos.length: photos and licenses are
+                    // padded to maxPhotos with nulls and must stay index-aligned.
+                    for (let i = 0; i < obs.photo_count; i++) rows.push({{obs: obs, photoIndex: i}});
+                }} else {{
+                    rows.push({{obs: obs, photoIndex: null}});
+                }}
+            }});
+            return rows;
+        }}
+
+        // Stable across split toggles, so a deselected photo stays deselected through a
+        // split -> unsplit -> re-split round trip. The merged row has its own key.
+        function rowKey(obs, photoIndex) {{
+            return obs.observation_id + ':' + (photoIndex === null ? 'all' : photoIndex);
+        }}
+
+        // Whether each display row is selected for export, keyed by rowKey().
+        // Seeded from the default heuristic below, then owned by the reviewer:
+        // re-rendering (after a split toggle, say) must not throw their choices away.
+        const selectionState = new Map();
+
+        function defaultSelected(obs, photoIndex) {{
+            // A split row exports only its own photo, so it needs only that photo
+            // licensed; a merged row exports all of them and needs all licensed.
+            const licensed = photoIndex === null
+                ? obs.all_media_licensed
+                : Boolean(obs.photo_licensed && obs.photo_licensed[photoIndex]);
+            return licensed &&
+                   !obs.has_non_organism_evidence &&
+                   !obs.is_skulls_and_bones &&
+                   obs.quality_grade !== 'needs_id';
+        }}
+
+        function isSelected(obs, photoIndex) {{
+            const key = rowKey(obs, photoIndex);
+            if (!selectionState.has(key)) {{
+                selectionState.set(key, defaultSelected(obs, photoIndex));
+            }}
+            return selectionState.get(key);
+        }}
 
         // Initialize
         document.addEventListener('DOMContentLoaded', function() {{
-            if (socialSplitMode) {{
-                initializeMergeColumn();
-            }}
+            initializeSplitColumn();
             renderObservations();
             updateCSV();
             updateStats();
         }});
 
-        function initializeMergeColumn() {{
-            // Show the merge column header
-            const mergeHeader = document.getElementById('merge-header');
-            if (mergeHeader) {{
-                mergeHeader.style.display = '';
-            }}
-        }}
-
-        function toggleMerge(sightingId) {{
-            if (!sightingId) return;
-
-            // Toggle merge state
-            const currentState = mergedSightings.get(sightingId) || false;
-            mergedSightings.set(sightingId, !currentState);
-
-            // Assign a random color when merging (if not already assigned)
-            if (!currentState && !mergedBorderColors.has(sightingId)) {{
-                const randomColor = mergeColors[Math.floor(Math.random() * mergeColors.length)];
-                mergedBorderColors.set(sightingId, randomColor);
-            }}
-
-            // Re-render to show updated state
-            renderObservations();
-            updateCSV();
+        function initializeSplitColumn() {{
+            // Only useful when something can actually be split.
+            const header = document.getElementById('split-header');
+            if (header && splitColumnShown) header.style.display = '';
         }}
 
         function renderObservations() {{
             const tbody = document.getElementById('observations-body');
             tbody.innerHTML = '';
 
-            // Sort observations: checked (selected) first, then unchecked
-            const sortedObservations = observations.map((obs, index) => ({{ obs, index }}))
-                .sort((a, b) => {{
-                    const aChecked = a.obs.license_display !== 'No license' &&
-                                     !a.obs.has_non_organism_evidence &&
-                                     !a.obs.is_skulls_and_bones &&
-                                     a.obs.quality_grade !== 'needs_id';
-                    const bChecked = b.obs.license_display !== 'No license' &&
-                                     !b.obs.has_non_organism_evidence &&
-                                     !b.obs.is_skulls_and_bones &&
-                                     b.obs.quality_grade !== 'needs_id';
-
-                    // Checked items (true) should come first
-                    if (aChecked === bChecked) return 0;
-                    return aChecked ? -1 : 1;
-                }});
-
-            // Track observation IDs for alternating colors
-            const observationIdMap = new Map();
-            let colorIndex = 0;
-
-            sortedObservations.forEach(({{obs, index}}) => {{
-                const tr = document.createElement('tr');
-
-                // Apply alternating row colors for social split mode
-                if (socialSplitMode && obs.sighting_id) {{
-                    // Assign color group based on observation_id
-                    if (!observationIdMap.has(obs.observation_id)) {{
-                        observationIdMap.set(obs.observation_id, colorIndex % 2);
-                        colorIndex++;
-                    }}
-                    const groupClass = observationIdMap.get(obs.observation_id) === 0 ? 'obs-group-even' : 'obs-group-odd';
-                    tr.classList.add(groupClass);
-
-                    // Check if this sighting is merged
-                    if (mergedSightings.get(obs.sighting_id)) {{
-                        tr.classList.add('merged-row');
-                        // Apply the assigned border color
-                        const borderColor = mergedBorderColors.get(obs.sighting_id);
-                        if (borderColor) {{
-                            tr.style.borderLeftColor = borderColor;
-                        }}
-                    }}
-                }}
-
-                // Checkbox
-                const tdCheckbox = document.createElement('td');
-                const checkbox = document.createElement('input');
-                checkbox.type = 'checkbox';
-                checkbox.className = 'obs-checkbox';
-                // Default to checked only if:
-                // 1. Observation has a license, AND
-                // 2. Evidence is NOT non-organism (track, scat, molt, etc.), AND
-                // 3. Observation is NOT part of "Skulls and Bones" project, AND
-                // 4. Quality grade is NOT "needs_id"
-                checkbox.checked = obs.license_display !== 'No license' &&
-                                   !obs.has_non_organism_evidence &&
-                                   !obs.is_skulls_and_bones &&
-                                   obs.quality_grade !== 'needs_id';
-                checkbox.id = `obs-${{index}}`;
-                checkbox.addEventListener('change', handleCheckboxChange);
-                tdCheckbox.appendChild(checkbox);
-                tr.appendChild(tdCheckbox);
-
-                // Photo preview
-                const tdPhoto = document.createElement('td');
-                if (obs.photo_path) {{
-                    const img = document.createElement('img');
-                    img.src = obs.photo_path;
-                    img.className = 'photo-preview';
-                    img.alt = 'Observation photo';
-                    img.onclick = () => openModal(obs.all_photo_paths, 0);
-                    tdPhoto.appendChild(img);
-                }} else {{
-                    const noPhoto = document.createElement('div');
-                    noPhoto.className = 'no-photo';
-                    noPhoto.textContent = 'No photo';
-                    tdPhoto.appendChild(noPhoto);
-                }}
-                tr.appendChild(tdPhoto);
-
-                // Observation ID
-                const tdId = document.createElement('td');
-                const link = document.createElement('a');
-                link.href = obs.url;
-                link.target = '_blank';
-                link.textContent = obs.observation_id;
-                tdId.appendChild(link);
-                tr.appendChild(tdId);
-
-                // Date
-                const tdDate = document.createElement('td');
-                tdDate.textContent = obs.observed_on || 'Unknown';
-                tr.appendChild(tdDate);
-
-                // Species
-                const tdSpecies = document.createElement('td');
-                const speciesDiv = document.createElement('div');
-                const scientificName = document.createElement('div');
-                scientificName.style.fontStyle = 'italic';
-                scientificName.textContent = obs.scientific_name || 'Unknown';
-                speciesDiv.appendChild(scientificName);
-                if (obs.common_name) {{
-                    const commonName = document.createElement('div');
-                    commonName.style.fontSize = '12px';
-                    commonName.style.color = '#666';
-                    commonName.textContent = obs.common_name;
-                    speciesDiv.appendChild(commonName);
-                }}
-                tdSpecies.appendChild(speciesDiv);
-                tr.appendChild(tdSpecies);
-
-                // Location
-                const tdLocation = document.createElement('td');
-                const locationDiv = document.createElement('div');
-                if (obs.location) {{
-                    locationDiv.textContent = obs.location;
-                }}
-                tdLocation.appendChild(locationDiv);
-                tr.appendChild(tdLocation);
-
-                // GPS Status (coordinates + obscured indicator)
-                const tdGps = document.createElement('td');
-                const gpsDiv = document.createElement('div');
-
-                if (obs.latitude && obs.longitude) {{
-                    // Show coordinates
-                    const coords = document.createElement('div');
-                    coords.style.fontSize = '11px';
-                    coords.style.color = '#666';
-                    coords.textContent = `${{parseFloat(obs.latitude).toFixed(4)}}, ${{parseFloat(obs.longitude).toFixed(4)}}`;
-                    gpsDiv.appendChild(coords);
-
-                    // Show obscured badge if coordinates are obscured
-                    if (obs.coordinates_obscured) {{
-                        const badge = document.createElement('span');
-                        badge.className = 'obscured-badge' + (obs.taxon_geoprivacy === 'obscured' ? ' taxon' : '');
-                        badge.textContent = obs.taxon_geoprivacy === 'obscured' ? 'TAXON' : 'OBSCURED';
-                        badge.title = obs.taxon_geoprivacy === 'obscured'
-                            ? 'Coordinates obscured due to species conservation status'
-                            : 'Coordinates obscured by observer';
-                        gpsDiv.appendChild(badge);
-
-                        // Show accuracy if available
-                        if (obs.public_positional_accuracy) {{
-                            const accuracy = document.createElement('div');
-                            accuracy.className = 'accuracy-info';
-                            const km = (obs.public_positional_accuracy / 1000).toFixed(1);
-                            accuracy.textContent = `±${{km}}km uncertainty`;
-                            gpsDiv.appendChild(accuracy);
-                        }}
-                    }} else {{
-                        // Show exact indicator
-                        const exact = document.createElement('div');
-                        exact.style.fontSize = '10px';
-                        exact.style.color = '#4caf50';
-                        exact.textContent = '✓ Exact';
-                        gpsDiv.appendChild(exact);
-                    }}
-                }} else {{
-                    gpsDiv.textContent = 'No GPS';
-                    gpsDiv.style.color = '#999';
-                }}
-
-                tdGps.appendChild(gpsDiv);
-                tr.appendChild(tdGps);
-
-                // Observer
-                const tdObserver = document.createElement('td');
-                tdObserver.textContent = obs.observer || 'Unknown';
-                tr.appendChild(tdObserver);
-
-                // Quality grade
-                const tdQuality = document.createElement('td');
-                const qualityBadge = document.createElement('span');
-                qualityBadge.className = `quality-badge quality-${{obs.quality_grade}}`;
-                qualityBadge.textContent = obs.quality_grade || 'unknown';
-                tdQuality.appendChild(qualityBadge);
-                tr.appendChild(tdQuality);
-
-                // License
-                const tdLicense = document.createElement('td');
-                tdLicense.textContent = obs.license_display || 'No license';
-                tdLicense.style.fontSize = '11px';
-                tr.appendChild(tdLicense);
-
-                // Photo count
-                const tdPhotoCount = document.createElement('td');
-                tdPhotoCount.textContent = obs.photo_count;
-                tr.appendChild(tdPhotoCount);
-
-                // Merge button (only in social split mode and only if sighting_id has multiple rows)
-                if (socialSplitMode) {{
-                    const tdMerge = document.createElement('td');
-                    // Only show merge button if this sighting_id appears in multiple rows
-                    const rowCount = sightingIdCounts.get(obs.sighting_id) || 0;
-                    if (obs.sighting_id && rowCount > 1) {{
-                        const isMerged = mergedSightings.get(obs.sighting_id) || false;
-                        const mergeBtn = document.createElement('button');
-                        mergeBtn.className = 'btn-merge' + (isMerged ? ' merged' : '');
-                        mergeBtn.textContent = isMerged ? 'Unmerge' : 'Merge';
-                        mergeBtn.onclick = () => toggleMerge(obs.sighting_id);
-                        tdMerge.appendChild(mergeBtn);
-                    }}
-                    tr.appendChild(tdMerge);
-                }}
-
-                tbody.appendChild(tr);
+            // Rank observations, not rows: expanding after sorting keeps an
+            // observation's photos adjacent instead of scattering them.
+            const ordered = observations.slice().sort((a, b) => {{
+                const aSel = anySelected(a), bSel = anySelected(b);
+                if (aSel === bSel) return 0;
+                return aSel ? -1 : 1;
             }});
+
+            let colorIndex = 0;
+            ordered.forEach(obs => {{
+                const split = isSplit(obs);
+                const groupClass = (colorIndex++ % 2 === 0) ? 'obs-group-even' : 'obs-group-odd';
+                const indices = split ? Array.from({{length: obs.photo_count}}, (_, i) => i) : [null];
+
+                indices.forEach(photoIndex => {{
+                    const tr = document.createElement('tr');
+                    // Which observation this rendered row belongs to. Lets a
+                    // reader (and a test) see grouping in the table itself
+                    // rather than inferring it from the data model, which is
+                    // observation-ordered by construction and so cannot show
+                    // whether sorting scattered a split group.
+                    tr.setAttribute('data-observation-id', obs.observation_id);
+                    if (split) tr.classList.add(groupClass);
+                    renderRow(tr, obs, photoIndex);
+                    tbody.appendChild(tr);
+                }});
+            }});
+
+            updateStats();
+        }}
+
+        function anySelected(obs) {{
+            if (isSplit(obs)) {{
+                for (let i = 0; i < obs.photo_count; i++) if (isSelected(obs, i)) return true;
+                return false;
+            }}
+            return isSelected(obs, null);
+        }}
+
+        // all_photo_paths holds null where a photo failed to download, so it stays
+        // index-aligned with photos. The modal cannot display a null, so hand it a
+        // compacted list and translate this row's photo index into that list --
+        // never pass photoIndex straight through as a gallery position.
+        function galleryFor(obs, photoIndex) {{
+            const paths = obs.all_photo_paths || [];
+            const gallery = paths.filter(p => p);
+            const target = photoIndex === null ? 0 : photoIndex;
+            let start = 0;
+            for (let i = 0; i < target && i < paths.length; i++) {{
+                if (paths[i]) start++;
+            }}
+            return {{gallery: gallery, start: Math.min(start, Math.max(0, gallery.length - 1))}};
+        }}
+
+        // Builds every cell of one display row: `photoIndex` is null for a merged
+        // row (the whole observation) or the zero-based photo for a split row.
+        function renderRow(tr, obs, photoIndex) {{
+            // Checkbox
+            const tdCheckbox = document.createElement('td');
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.className = 'obs-checkbox';
+            // Keyed on the composite row key, not an array index.
+            checkbox.checked = isSelected(obs, photoIndex);
+            checkbox.id = `obs-${{rowKey(obs, photoIndex)}}`;
+            checkbox.addEventListener('change', () => {{
+                selectionState.set(rowKey(obs, photoIndex), checkbox.checked);
+                handleCheckboxChange();
+            }});
+            tdCheckbox.appendChild(checkbox);
+            tr.appendChild(tdCheckbox);
+
+            // Photo preview. A split row previews the photo it will export --
+            // all_photo_paths is index-aligned with photos (null where a download
+            // failed), so photoIndex means the same thing in both.
+            const photoPath = photoIndex === null
+                ? obs.photo_path
+                : (obs.all_photo_paths && obs.all_photo_paths[photoIndex]) || null;
+            const tdPhoto = document.createElement('td');
+            if (photoPath) {{
+                const img = document.createElement('img');
+                img.src = photoPath;
+                img.className = 'photo-preview';
+                img.alt = 'Observation photo';
+                // Open the gallery on the photo this row shows, not always the first.
+                img.onclick = () => {{
+                    const g = galleryFor(obs, photoIndex);
+                    openModal(g.gallery, g.start);
+                }};
+                tdPhoto.appendChild(img);
+            }} else {{
+                const noPhoto = document.createElement('div');
+                noPhoto.className = 'no-photo';
+                noPhoto.textContent = 'No photo';
+                tdPhoto.appendChild(noPhoto);
+            }}
+            tr.appendChild(tdPhoto);
+
+            // Observation ID
+            const tdId = document.createElement('td');
+            const link = document.createElement('a');
+            link.href = obs.url;
+            link.target = '_blank';
+            link.textContent = obs.observation_id;
+            tdId.appendChild(link);
+            tr.appendChild(tdId);
+
+            // Date
+            const tdDate = document.createElement('td');
+            tdDate.textContent = obs.observed_on || 'Unknown';
+            tr.appendChild(tdDate);
+
+            // Species
+            const tdSpecies = document.createElement('td');
+            const speciesDiv = document.createElement('div');
+            const scientificName = document.createElement('div');
+            scientificName.style.fontStyle = 'italic';
+            scientificName.textContent = obs.scientific_name || 'Unknown';
+            speciesDiv.appendChild(scientificName);
+            if (obs.common_name) {{
+                const commonName = document.createElement('div');
+                commonName.style.fontSize = '12px';
+                commonName.style.color = '#666';
+                commonName.textContent = obs.common_name;
+                speciesDiv.appendChild(commonName);
+            }}
+            tdSpecies.appendChild(speciesDiv);
+            tr.appendChild(tdSpecies);
+
+            // Location
+            const tdLocation = document.createElement('td');
+            const locationDiv = document.createElement('div');
+            if (obs.location) {{
+                locationDiv.textContent = obs.location;
+            }}
+            tdLocation.appendChild(locationDiv);
+            tr.appendChild(tdLocation);
+
+            // GPS Status (coordinates + obscured indicator)
+            const tdGps = document.createElement('td');
+            const gpsDiv = document.createElement('div');
+
+            const hasCoords = obs.latitude !== null && obs.latitude !== undefined && obs.latitude !== ''
+                          && obs.longitude !== null && obs.longitude !== undefined && obs.longitude !== '';
+            if (hasCoords) {{
+                // Show coordinates
+                const coords = document.createElement('div');
+                coords.style.fontSize = '11px';
+                coords.style.color = '#666';
+                coords.textContent = `${{parseFloat(obs.latitude).toFixed(4)}}, ${{parseFloat(obs.longitude).toFixed(4)}}`;
+                gpsDiv.appendChild(coords);
+
+                // Show obscured badge if coordinates are obscured
+                if (obs.coordinates_obscured) {{
+                    const badge = document.createElement('span');
+                    badge.className = 'obscured-badge' + (obs.taxon_geoprivacy === 'obscured' ? ' taxon' : '');
+                    badge.textContent = obs.taxon_geoprivacy === 'obscured' ? 'TAXON' : 'OBSCURED';
+                    badge.title = obs.taxon_geoprivacy === 'obscured'
+                        ? 'Coordinates obscured due to species conservation status'
+                        : 'Coordinates obscured by observer';
+                    gpsDiv.appendChild(badge);
+
+                    // Show accuracy if available
+                    if (obs.public_positional_accuracy) {{
+                        const accuracy = document.createElement('div');
+                        accuracy.className = 'accuracy-info';
+                        const km = (obs.public_positional_accuracy / 1000).toFixed(1);
+                        accuracy.textContent = `±${{km}}km uncertainty`;
+                        gpsDiv.appendChild(accuracy);
+                    }}
+                }} else {{
+                    // Show exact indicator
+                    const exact = document.createElement('div');
+                    exact.style.fontSize = '10px';
+                    exact.style.color = '#4caf50';
+                    exact.textContent = '✓ Exact';
+                    gpsDiv.appendChild(exact);
+                }}
+            }} else {{
+                gpsDiv.textContent = 'No GPS';
+                gpsDiv.style.color = '#999';
+            }}
+
+            tdGps.appendChild(gpsDiv);
+            tr.appendChild(tdGps);
+
+            // Observer
+            const tdObserver = document.createElement('td');
+            tdObserver.textContent = obs.observer || 'Unknown';
+            tr.appendChild(tdObserver);
+
+            // Quality grade
+            const tdQuality = document.createElement('td');
+            const qualityBadge = document.createElement('span');
+            qualityBadge.className = `quality-badge quality-${{obs.quality_grade}}`;
+            qualityBadge.textContent = obs.quality_grade || 'unknown';
+            tdQuality.appendChild(qualityBadge);
+            tr.appendChild(tdQuality);
+
+            // License
+            const tdLicense = document.createElement('td');
+            tdLicense.textContent = obs.license_display || 'No license';
+            tdLicense.style.fontSize = '11px';
+            tr.appendChild(tdLicense);
+
+            // Photo count
+            const tdPhotoCount = document.createElement('td');
+            tdPhotoCount.textContent = photoIndex === null ? obs.photo_count : 1;
+            tr.appendChild(tdPhotoCount);
+
+            // Split / Unsplit control. Appended only when the Split column exists
+            // at all -- initializeSplitColumn() keeps its <th> hidden when nothing
+            // on the page can be split, and an unconditional cell here would leave
+            // such a page with 12 <td> under 11 visible <th>.
+            if (splitColumnShown) {{
+                const tdSplit = document.createElement('td');
+                if (obs.can_split) {{
+                    const btn = document.createElement('button');
+                    btn.className = 'btn-split' + (isSplit(obs) ? ' split' : '');
+                    btn.textContent = isSplit(obs) ? 'Unsplit' : 'Split';
+                    btn.onclick = () => toggleSplit(obs.observation_id);
+                    tdSplit.appendChild(btn);
+                }}
+                tr.appendChild(tdSplit);
+            }}
         }}
 
         function handleCheckboxChange() {{
@@ -1695,42 +1997,40 @@ class iNaturalistDownloader:
         }}
 
         function updateStats() {{
-            const total = observations.length;
-            const selected = getSelectedObservations().length;
-            const obscured = observations.filter(obs => obs.coordinates_obscured).length;
-
-            document.getElementById('total-count').textContent = total;
-            document.getElementById('selected-count').textContent = selected;
-            document.getElementById('obscured-count').textContent = obscured;
+            const rows = displayRows();
+            document.getElementById('total-count').textContent = rows.length;
+            document.getElementById('selected-count').textContent =
+                rows.filter(r => isSelected(r.obs, r.photoIndex)).length;
+            document.getElementById('obscured-count').textContent =
+                observations.filter(obs => obs.coordinates_obscured).length;
         }}
 
         function getSelectedObservations() {{
-            const selected = [];
-            observations.forEach((obs, index) => {{
-                const checkbox = document.getElementById(`obs-${{index}}`);
-                if (checkbox && checkbox.checked) {{
-                    selected.push(obs);
+            return displayRows().filter(r => isSelected(r.obs, r.photoIndex));
+        }}
+
+        function setAllSelected(value) {{
+            // Write BOTH sides of every split toggle, not just the rows on screen.
+            // An explicit "Deselect All" has to survive a later Split: writing only
+            // the current display rows would leave the other side unkeyed, and
+            // defaultSelected() would then re-seed it and silently re-arm rows the
+            // reviewer had excluded.
+            observations.forEach(obs => {{
+                selectionState.set(rowKey(obs, null), value);
+                for (let i = 0; i < obs.photo_count; i++) {{
+                    selectionState.set(rowKey(obs, i), value);
                 }}
             }});
-            return selected;
+            renderObservations();
+            updateCSV();
         }}
 
         function selectAll() {{
-            observations.forEach((obs, index) => {{
-                const checkbox = document.getElementById(`obs-${{index}}`);
-                if (checkbox) checkbox.checked = true;
-            }});
-            updateStats();
-            updateCSV();
+            setAllSelected(true);
         }}
 
         function deselectAll() {{
-            observations.forEach((obs, index) => {{
-                const checkbox = document.getElementById(`obs-${{index}}`);
-                if (checkbox) checkbox.checked = false;
-            }});
-            updateStats();
-            updateCSV();
+            setAllSelected(false);
         }}
 
         function updateCSV() {{
@@ -1739,65 +2039,17 @@ class iNaturalistDownloader:
             document.getElementById('csv-output').textContent = csv;
         }}
 
-        function generateCSV(data) {{
-            if (data.length === 0) {{
+        // Takes display rows -- {{obs, photoIndex}} pairs from displayRows() -- so
+        // there is nothing to regroup here: a split observation already arrives as
+        // one row per photo.
+        function generateCSV(rows) {{
+            if (rows.length === 0) {{
                 return 'No observations selected';
             }}
 
-            // Process data: merge rows if their sighting_id is marked as merged
-            let processedData = [];
-
-            if (socialSplitMode) {{
-                // Group observations by sighting_id
-                const sightingGroups = new Map();
-
-                data.forEach(obs => {{
-                    const sightingId = obs.sighting_id;
-
-                    // If this sighting is merged, group all rows together
-                    if (sightingId && mergedSightings.get(sightingId)) {{
-                        if (!sightingGroups.has(sightingId)) {{
-                            sightingGroups.set(sightingId, []);
-                        }}
-                        sightingGroups.get(sightingId).push(obs);
-                    }} else {{
-                        // Not merged, add as individual row
-                        processedData.push(obs);
-                    }}
-                }});
-
-                // Merge grouped observations into single rows
-                sightingGroups.forEach((obsGroup, sightingId) => {{
-                    if (obsGroup.length === 0) return;
-
-                    // Use first observation as base
-                    const mergedObs = {{ ...obsGroup[0] }};
-
-                    // Collect all photos and licenses from all observations in the group
-                    const allPhotos = [];
-                    const allLicenses = [];
-
-                    obsGroup.forEach(obs => {{
-                        obs.photos.forEach((photo, idx) => {{
-                            if (photo) {{
-                                allPhotos.push(photo);
-                                allLicenses.push(obs.licenses[idx] || '');
-                            }}
-                        }});
-                    }});
-
-                    // Update merged observation with combined photos
-                    mergedObs.photos = allPhotos;
-                    mergedObs.licenses = allLicenses;
-                    mergedObs.photo_count = allPhotos.length;
-                    mergedObs.photo_filenames = allPhotos.join('; ');
-
-                    processedData.push(mergedObs);
-                }});
-            }} else {{
-                // Not in social split mode, use data as-is
-                processedData = data;
-            }}
+            // Sized before the header is built, so the mediaAsset columns match
+            // the rows actually written.
+            const columnCount = csvColumnCount(rows);
 
             // Build header
             const headers = [
@@ -1823,21 +2075,36 @@ class iNaturalistDownloader:
                 'observer',
                 'quality_grade',
                 'url',
+                'Encounter.otherCatalogNumbers',
                 'Encounter.researcherComments',
                 'photo_count',
                 'photo_filenames'
             ];
 
-            // Add photo asset columns
-            for (let i = 0; i < maxPhotos; i++) {{
+            // Add photo asset columns.
+            for (let i = 0; i < columnCount; i++) {{
                 headers.push(`Encounter.mediaAsset${{i}}`);
                 headers.push(`Encounter.mediaAsset${{i}}.license`);
             }}
 
-            const rows = [headers.join(',')];
+            const lines = [headers.join(',')];
 
             // Add data rows
-            processedData.forEach(obs => {{
+            rows.forEach(({{obs, photoIndex}}) => {{
+                // A split row carries only its own photo; a merged row carries the
+                // observation's real photos, without the null padding to maxPhotos.
+                const photos = photoIndex === null
+                    ? obs.photos.slice(0, obs.photo_count)
+                    : [obs.photos[photoIndex]];
+                const licenses = photoIndex === null
+                    ? obs.licenses.slice(0, obs.photo_count)
+                    : [obs.licenses[photoIndex]];
+
+                // Mode-dependent BY DESIGN -- see the spec, decision 4. With the flag,
+                // every row keeps a sighting ID so existing Wildbook imports are
+                // unchanged, even a lone row. Do not "simplify" this to isSplit alone.
+                const sightingId = (socialSplitMode || isSplit(obs)) ? obs.sighting_id : '';
+
                 const row = [
                     escapeCSV(obs.observation_id),
                     escapeCSV(obs.observed_on),
@@ -1857,46 +2124,83 @@ class iNaturalistDownloader:
                     escapeCSV('unapproved'),  // Encounter.state - always unapproved
                     escapeCSV(obs.project_name),
                     escapeCSV(obs.project_owner),
-                    escapeCSV(obs.sighting_id),
+                    escapeCSV(sightingId),
                     escapeCSV(obs.observer),
                     escapeCSV(obs.quality_grade),
                     escapeCSV(obs.url),
+                    escapeCSV(obs.other_catalog_numbers),
                     escapeCSV(obs.researcher_comments),
-                    escapeCSV(obs.photo_count),
-                    escapeCSV(obs.photo_filenames)
+                    escapeCSV(photos.length),
+                    escapeCSV(photos.join('; '))
                 ];
 
                 // Add photo assets and licenses
-                for (let i = 0; i < maxPhotos; i++) {{
-                    row.push(escapeCSV(obs.photos[i]));
-                    row.push(escapeCSV(obs.licenses[i]));
+                for (let i = 0; i < columnCount; i++) {{
+                    row.push(escapeCSV(photos[i]));
+                    row.push(escapeCSV(licenses[i]));
                 }}
 
-                rows.push(row.join(','));
+                lines.push(row.join(','));
             }});
 
-            return rows.join('\\n');
+            return lines.join('\\n');
+        }}
+
+        function csvColumnCount(rows) {{
+            // Sized from the rows actually written: an all-split export must not carry
+            // empty mediaAsset columns, and a merged one must fit its widest row.
+            return Math.max(1, ...rows.map(
+                r => r.photoIndex === null ? r.obs.photo_count : 1
+            ));
         }}
 
         function escapeCSV(value) {{
             if (value === null || value === undefined) {{
                 return '';
             }}
-            const str = String(value);
-            if (str.includes(',') || str.includes('"') || str.includes('\\n')) {{
+            let str = String(value);
+            // Neutralise spreadsheet formula injection from iNaturalist free
+            // text, but leave genuine negative numbers (latitudes) alone.
+            if (/^[=+\\-@\\t\\r]/.test(str) && !/^-?\\d*\\.?\\d+$/.test(str)) {{
+                str = "'" + str;
+            }}
+            if (/[",\\r\\n]/.test(str)) {{
                 return '"' + str.replace(/"/g, '""') + '"';
             }}
             return str;
         }}
 
+        function flashCopyStatus(message, isError) {{
+            const success = document.getElementById('copy-success');
+            success.textContent = message;
+            // Explicit Boolean() so a success call (isError omitted) clears any
+            // .copy-error left over from a previous failed attempt.
+            success.classList.toggle('copy-error', Boolean(isError));
+            success.classList.add('show');
+            setTimeout(() => {{
+                success.classList.remove('show');
+            }}, 5000);
+        }}
+
         function copyCSV() {{
             const csv = document.getElementById('csv-output').textContent;
-            navigator.clipboard.writeText(csv).then(() => {{
-                const success = document.getElementById('copy-success');
-                success.classList.add('show');
-                setTimeout(() => {{
-                    success.classList.remove('show');
-                }}, 3000);
+
+            // This page is opened over file://, where the Clipboard API is
+            // frequently missing or blocked outright. Feature-detect and catch
+            // the rejection: without both, the reviewer got a TypeError or a
+            // silent unhandled rejection and no feedback at all.
+            const clipboard = navigator.clipboard;
+            if (!clipboard || typeof clipboard.writeText !== 'function') {{
+                flashCopyStatus('Clipboard is unavailable in this browser context. '
+                    + 'Use "Download CSV File" instead.', true);
+                return;
+            }}
+
+            clipboard.writeText(csv).then(() => {{
+                flashCopyStatus('CSV content copied to clipboard!');
+            }}).catch(() => {{
+                flashCopyStatus('The browser blocked clipboard access. '
+                    + 'Use "Download CSV File" instead.', true);
             }});
         }}
 
@@ -2093,21 +2397,11 @@ class iNaturalistDownloader:
             processed_data = self.process_observations(observations, species_name)
             all_observations_data.extend(processed_data)
 
-        # Deduplicate observations by observation_id
-        # (Multiple species names may resolve to the same taxon, causing duplicates)
         if all_observations_data:
             print(f"\nDeduplicating observations...")
-            print(f"  Total observations before deduplication: {len(all_observations_data)}")
-
-            # Use a dict to deduplicate by observation_id, keeping first occurrence
-            unique_obs = {}
-            for obs in all_observations_data:
-                obs_id = obs.get('observation_id')
-                if obs_id not in unique_obs:
-                    unique_obs[obs_id] = obs
-
-            all_observations_data = list(unique_obs.values())
-            print(f"  Unique observations after deduplication: {len(all_observations_data)}")
+            print(f"  Total rows before deduplication: {len(all_observations_data)}")
+            all_observations_data = self.deduplicate_rows(all_observations_data)
+            print(f"  Unique rows after deduplication: {len(all_observations_data)}")
 
         # Write to CSV or HTML
         if all_observations_data:
@@ -2121,8 +2415,13 @@ class iNaturalistDownloader:
                 html_filename = f"inat_observations_review_{species_part}{place_part}_{timestamp}.html"
                 self.write_html(all_observations_data, html_filename)
             else:
+                # The HTML path does its own splitting in the browser, so only the
+                # direct-CSV path needs it applied here.
+                csv_rows = all_observations_data
+                if self.social_split:
+                    csv_rows = split_rows_by_photo(csv_rows)
                 csv_filename = f"inat_observations_{species_part}{place_part}_{timestamp}.csv"
-                self.write_csv(all_observations_data, csv_filename)
+                self.write_csv(csv_rows, csv_filename)
 
             print("\n" + "=" * 60)
             print("Download complete!")
@@ -2171,6 +2470,22 @@ Examples:
         type=int,
         default=30,
         help='Number of days back to search for observations (default: 30)'
+    )
+
+    parser.add_argument(
+        '--start-date',
+        type=str,
+        default=None,
+        help='Explicit window start, YYYY-MM-DD. Overrides --days. '
+             'Use with --end-date to backfill a closed historical range.'
+    )
+
+    parser.add_argument(
+        '--end-date',
+        type=str,
+        default=None,
+        help='Explicit window end, YYYY-MM-DD (default: today). Inclusive, so '
+             '--end-date 2025-06-20 covers all of 20 June 2025.'
     )
 
     parser.add_argument(
@@ -2238,19 +2553,30 @@ Examples:
         print("Error: --rate-limit must be non-negative")
         sys.exit(1)
 
-    # Create downloader and run
-    downloader = iNaturalistDownloader(
-        output_dir=args.output,
-        days_back=args.days,
-        species_list=args.species,
-        rate_limit=args.rate_limit,
-        html_review=args.html_review,
-        place=args.place,
-        location_id=args.use_locationID,
-        submitter_id=args.use_submitterID,
-        social_split=args.social_split_observations,
-        project_owner=args.project_owner
-    )
+    if args.start_date and args.end_date and '--days' in sys.argv:
+        print("Note: --days is ignored when both --start-date and --end-date are given.")
+
+    # Create downloader and run. Construction validates the date window, so a
+    # malformed --start-date/--end-date must exit cleanly here rather than
+    # surfacing as a traceback before anything has been downloaded.
+    try:
+        downloader = iNaturalistDownloader(
+            output_dir=args.output,
+            days_back=args.days,
+            species_list=args.species,
+            rate_limit=args.rate_limit,
+            html_review=args.html_review,
+            place=args.place,
+            location_id=args.use_locationID,
+            submitter_id=args.use_submitterID,
+            social_split=args.social_split_observations,
+            project_owner=args.project_owner,
+            start_date=args.start_date,
+            end_date=args.end_date
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
     try:
         downloader.run()
