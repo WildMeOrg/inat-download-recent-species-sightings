@@ -248,14 +248,35 @@ python3 inat-download-new-species-sightings.py \
 > multi-photo observation, or (b) keep it and rename the flag to reflect what
 > it does. The behaviour is unchanged for now so no existing workflow shifts
 > underfoot.
+>
+> **Partially mitigated:** the per-observation Split button means this suppression is no
+> longer the last word — a reviewer can split any observation the flag skipped. The
+> question of what the flag's default *should* be is still open.
 
-**HTML Review Mode Features (when using --social-split-observations):**
-- **Alternating row colors**: Rows from the same original observation are color-coded (alternating light green and white backgrounds) to help you identify which rows belong together
-- **Merge button**: Each split observation has a "Merge" button. Click it to re-combine all photos from that observation back into a single row
-  - Merged rows are highlighted with a green border and background
-  - The "Merge" button becomes "Unmerge" - click again to undo the merge
-  - Merged rows appear as a single row in the exported CSV with all photos combined
-  - Unmerged rows remain as separate CSV rows (one per photo)
+**HTML Review Mode Features:**
+
+Every observation with more than one photo gets a **Split** button, whether or not
+`--social-split-observations` was used. Press it and the row expands into one row per
+photo, each with its own checkbox, all sharing one `Sighting.sightingID` so Wildbook
+still records them as a single sighting. Deselect any photo to leave it out entirely.
+**Unsplit** collapses the rows back together.
+
+- Rows from the same observation are colour-coded (alternating backgrounds) so you can
+  see which belong together
+- A split row is selected by default if *its own* photo carries a license, so splitting
+  is a way to keep the CC-licensed photos from an observation that is otherwise
+  deselected because one photo is all-rights-reserved
+- `--social-split-observations` now only sets the *starting* state: observations it would
+  have split start split, and you can Unsplit any of them
+- Split state lives in the page only. Reloading the file starts from the defaults again.
+- **Select All** overrides the per-photo license default above: it arms every visible row,
+  including a split row whose own photo carries no license. It is a bulk override, not a
+  way to double-check what the defaults chose.
+- The **Total Observations** stat counts display rows, not original iNaturalist
+  observations — splitting a 4-photo observation into 4 rows makes the count go up by 3.
+  It is the right number for "rows about to be exported," but no longer a literal count of
+  observations. **GPS Obscured** is unaffected: it still counts original observations, so
+  the two stats can diverge while any row is split.
 
 ## Output Structure
 
